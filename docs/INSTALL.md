@@ -58,7 +58,8 @@ synthetic video source and a generated tone:
 ```
 
 It prints a password **once**. Copy it now — only a bcrypt hash is stored, so it
-cannot be recovered later (`./dev.sh run -new-password` generates a new one).
+cannot be recovered later (`./dev.sh run -new-password` generates a new one; restart
+the server afterwards, since the config is only read at startup).
 
 Open <http://127.0.0.1:9000>, sign in, and you should see a moving test pattern. Click
 the 🔇 button for the test tone. If that works, WebRTC, the encoder, the audio path,
@@ -138,7 +139,7 @@ hostname with no open inbound ports.
 ./dev.sh run -allow-input -width 1920   # higher resolution (height follows your display)
 ./dev.sh run -allow-input -fps 60 -bitrate 15000000
 ./dev.sh run -audio=false               # video only
-./dev.sh run -set-password              # change the password (reads from stdin)
+./dev.sh run -set-password              # change the password (stdin; then restart)
 ```
 
 Height is derived from your display's aspect ratio automatically — set `-width` and

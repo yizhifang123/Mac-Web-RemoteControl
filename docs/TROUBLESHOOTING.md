@@ -109,18 +109,24 @@ Something else holds port 9000 — `lsof -nP -iTCP:9000 -sTCP:LISTEN` shows what
 
 **I lost the password**
 It's stored only as a bcrypt hash and cannot be recovered. Generate a new one with
-`./dev.sh run -new-password`, or set your own with `./dev.sh run -set-password`.
+`./dev.sh run -new-password`, or set your own with `./dev.sh run -set-password`. Both
+write the config file and exit — **restart the server** afterwards.
 
 **I changed the password and it still wants the old one**
-Restart the server. Credentials are loaded once at startup.
+Restart the server. Credentials are loaded once at startup, so a process that was
+already running keeps the old password *and* the old sessions until you restart it.
+This matters if you are changing the password because a session may have been stolen:
+until the restart, that session is still live.
 
 **Signed out unexpectedly**
 Sessions last 24 hours, and changing the password deliberately invalidates every
-existing session.
+existing session — from the next server start.
 
 **`too many attempts`**
-The brute-force throttle: 10 failures from one client triggers a one-minute lockout,
-and 30 failures per minute across all clients throttles globally. Wait a minute.
+The per-client lockout: 10 failures from one address triggers a one-minute lockout.
+Wait a minute. If instead your login is simply *slow* (a couple of seconds), that's the
+global throttle — more than 30 failed attempts a minute are arriving from somewhere, so
+every attempt is being paced. It will still let you in with the right password.
 
 ## Still stuck?
 

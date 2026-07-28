@@ -15,8 +15,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -89,7 +91,11 @@ func main() {
 func runSetPassword(configPath string) {
 	fmt.Fprint(os.Stderr, "New password (input is not hidden; paste or pipe it): ")
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil && line == "" {
+	// EOF is expected — input piped without a trailing newline. Any OTHER error means
+	// the input was cut short, and whatever arrived first must NOT be stored as the
+	// password: it would silently become a truncated secret the user cannot guess and
+	// cannot recover, since the previous hash is already gone.
+	if err != nil && !errors.Is(err, io.EOF) {
 		log.Fatalf("read password: %v", err)
 	}
 	password := strings.TrimRight(line, "\r\n")
@@ -99,7 +105,9 @@ func runSetPassword(configPath string) {
 		log.Fatalf("set password: %v", err)
 	}
 	fmt.Fprintf(os.Stderr, "\npassword updated in %s\n", configPath)
-	fmt.Fprintln(os.Stderr, "all existing browser sessions were signed out.")
+	fmt.Fprintln(os.Stderr, "RESTART the server for this to take effect. A running process holds")
+	fmt.Fprintln(os.Stderr, "the old password and old sessions in memory until it is restarted —")
+	fmt.Fprintln(os.Stderr, "if you are rotating because a session may be stolen, restart NOW.")
 	if warning != "" {
 		fmt.Fprintf(os.Stderr, "note: %s\n", warning)
 	}

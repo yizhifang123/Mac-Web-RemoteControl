@@ -75,6 +75,8 @@ whatever is missing. Start there if anything goes wrong.
 
 The first run prints a password **once** — save it. Only a bcrypt hash is stored, so it
 cannot be recovered (`-new-password` generates a new one, `-set-password` sets your own).
+Both write the config file and exit; the server reads it only at startup, so restart
+anything already running before the change takes effect.
 
 Then open <http://127.0.0.1:9000> and sign in.
 
@@ -101,8 +103,8 @@ Privacy & Security, then restart the server. macOS only re-reads permissions at 
 | `-audio=false` | Disable the audio track |
 | `-source screen-test` | Synthetic video + tone — no permissions needed |
 | `-addr 0.0.0.0:9000` | Bind for LAN testing (read the security docs first) |
-| `-set-password` | Read a new password from stdin and exit |
-| `-new-password` | Generate a random password, print it, and exit |
+| `-set-password` | Read a new password from stdin and exit (then restart the server) |
+| `-new-password` | Generate a random password, print it, and exit (then restart) |
 
 ## Hosting it on your own domain
 

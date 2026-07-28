@@ -70,8 +70,16 @@ Two layers, because per-IP throttling alone is defeated by anyone with a proxy p
 - **Per client IP:** 10 failures triggers a 1-minute lockout. Behind a tunnel every
   request appears to come from `127.0.0.1`, so `CF-Connecting-IP` is used when present
   to keep one attacker from locking out everyone.
-- **Globally:** 30 failed attempts per minute across all clients, total. Far above any
+- **Globally:** past 30 failed attempts per minute across all clients, every login
+  attempt is *slowed* to 2 seconds — and verified one at a time, so that ceiling holds
+  no matter how many connections or source addresses an attacker opens. Far above any
   human fumbling a password, far below what makes dictionary attacks practical.
+
+The global layer slows attempts rather than refusing them, and that distinction is the
+whole design. Your login goes through the same door as the attacker's, so anything the
+throttle refuses outright is something an attacker can refuse *on your behalf* — 30
+POSTs a minute from a handful of addresses would buy them a permanent lockout of your
+own machine. A correct password is never rejected by the global cap, only delayed.
 
 ## What this does NOT protect against
 
@@ -85,8 +93,10 @@ Be clear-eyed about the gaps:
 - **Physical access to the Mac.** Unchanged by anything here.
 - **Your tunnel provider.** Signaling passes through it in plaintext at their edge.
   Media does not — it is DTLS-encrypted and peer-to-peer — but SDP does.
-- **Denial of service.** The global rate limit intentionally trades availability for
-  brute-force resistance: a sustained attack can make login temporarily unavailable.
+- **Denial of service.** Nothing here stops someone flooding your tunnel. The global
+  throttle is deliberately built *not* to make that worse — it delays logins instead of
+  refusing them, so a sustained attack makes signing in slow rather than impossible —
+  but slow is still a cost you pay and they don't.
 
 ## Before you expose it: attack your own setup
 

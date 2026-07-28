@@ -9,11 +9,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 // newTestAuth creates a gate in a temp dir and returns it with its fresh password.
+// The throttle waits are zeroed: they are real seconds in production and tests that
+// care about them set their own.
 func newTestAuth(t *testing.T) (*Auth, string, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")
@@ -24,6 +27,7 @@ func newTestAuth(t *testing.T) (*Auth, string, string) {
 	if password == "" {
 		t.Fatal("expected a generated password on first run")
 	}
+	a.failWait, a.throttleWait = 0, 0
 	return a, password, path
 }
 
@@ -300,6 +304,16 @@ func TestSetPasswordInvalidatesSessionsAndKeepsToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
+	after.failWait, after.throttleWait = 0, 0
+
+	// SetPassword writes the FILE; it does not reach into a process that is already
+	// running. The already-loaded gate keeps honouring the old secrets, which is
+	// exactly why the CLI tells the user to restart. Pinned here so the code and that
+	// warning cannot drift apart.
+	if !before.validCookie(oldSession) {
+		t.Error("an already-loaded gate stopped honouring its session; then -set-password " +
+			"would take effect live and the 'restart the server' warning would be wrong")
+	}
 
 	if after.validCookie(oldSession) {
 		t.Error("a session issued before the password change still works; a password change must sign everyone out")
@@ -330,33 +344,98 @@ func TestSetPasswordInvalidatesSessionsAndKeepsToken(t *testing.T) {
 
 func TestSetPasswordWarnsOnShortPasswords(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	if warning, _ := SetPassword(path, "short"); warning == "" {
-		t.Error("expected a warning for a 5-character password")
-	}
-	if warning, _ := SetPassword(path, "a-perfectly-long-passphrase"); warning != "" {
-		t.Errorf("unexpected warning for a long password: %q", warning)
+	for _, tc := range []struct {
+		name, password string
+		wantWarning    bool
+	}{
+		{"five characters", "short", true},
+		// Below the floor the warning text itself recommends: a threshold that
+		// disagreed with its own advice let this through silently.
+		{"thirteen characters", "thirteenchars", true},
+		{"at the floor", strings.Repeat("a", minPasswordLen), false},
+		{"comfortably long", "a-perfectly-long-passphrase", false},
+		// 8 characters but 24 bytes: counted as bytes this slips past the check.
+		{"short but multibyte", "日本語パスワード", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			warning, err := SetPassword(path, tc.password)
+			if err != nil {
+				t.Fatalf("SetPassword: %v", err)
+			}
+			if got := warning != ""; got != tc.wantWarning {
+				t.Errorf("warned = %v, want %v (warning %q)", got, tc.wantWarning, warning)
+			}
+		})
 	}
 }
 
-func TestGlobalThrottleCapsDistributedGuessing(t *testing.T) {
+// distributedAttempt posts a login from a DIFFERENT address each time, so per-IP
+// lockout never fires and only the global throttle is in play.
+func distributedAttempt(h http.Handler, i int, pw string) *http.Response {
+	form := url.Values{"password": {pw}}
+	r := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.Header.Set("CF-Connecting-IP", "203.0.113."+strconv.Itoa(i%256))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	return w.Result()
+}
+
+// Past the global cap the owner must still be able to log in. The throttle is
+// reachable by any anonymous client, so anything it refuses outright is something an
+// attacker can refuse on the owner's behalf — 30 POSTs a minute would otherwise buy a
+// permanent lockout of the owner's own Mac.
+func TestGlobalThrottleNeverLocksOutTheOwner(t *testing.T) {
 	a, password, _ := newTestAuth(t)
+	a.throttleWait = 150 * time.Millisecond
 	h := protected(a)
 
-	// Every attempt comes from a DIFFERENT address, so per-IP lockout never fires;
-	// only the global cap can stop this.
-	attempt := func(i int, pw string) int {
-		form := url.Values{"password": {pw}}
-		r := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
-		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		r.Header.Set("CF-Connecting-IP", "203.0.113."+strconv.Itoa(i%256))
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, r)
-		return w.Code
-	}
 	for i := 0; i < globalFailsPerMin; i++ {
-		attempt(i, "wrong")
+		if resp := distributedAttempt(h, i, "wrong"); resp.StatusCode == http.StatusTooManyRequests {
+			t.Fatalf("failure %d was refused with 429; each source address should get its own budget", i)
+		}
 	}
-	if code := attempt(999, password); code != http.StatusTooManyRequests {
-		t.Errorf("status = %d after %d distributed failures, want 429", code, globalFailsPerMin)
+
+	// The owner arrives mid-attack, from an address never seen before.
+	start := time.Now()
+	resp := distributedAttempt(h, 999, password)
+	elapsed := time.Since(start)
+
+	if len(resp.Cookies()) == 0 {
+		t.Fatalf("the correct password was refused during a distributed attack (status %d); "+
+			"any anonymous client could then lock the owner out indefinitely", resp.StatusCode)
+	}
+	if elapsed < a.throttleWait {
+		t.Errorf("throttled login took %v, want >= %v; the cap is not slowing guesses down",
+			elapsed, a.throttleWait)
+	}
+}
+
+// Slowing each attempt only bounds the attack if attempts cannot run side by side.
+func TestGlobalThrottleSerializesConcurrentGuesses(t *testing.T) {
+	a, _, _ := newTestAuth(t)
+	a.throttleWait = 50 * time.Millisecond
+	h := protected(a)
+
+	for i := 0; i < globalFailsPerMin; i++ {
+		distributedAttempt(h, i, "wrong")
+	}
+
+	const concurrent = 4
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			distributedAttempt(h, 100+i, "wrong")
+		}(i)
+	}
+	wg.Wait()
+
+	// Serialized: concurrent*wait. Unserialized they would all finish in one wait.
+	if min := (concurrent - 1) * a.throttleWait; time.Since(start) < min {
+		t.Errorf("%d concurrent guesses took %v, want >= %v; concurrency is bypassing the throttle",
+			concurrent, time.Since(start), min)
 	}
 }

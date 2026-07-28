@@ -14,7 +14,9 @@
 //
 // Secrets live in a 0600 JSON file (default ~/.config/play/config.json). The password
 // is stored ONLY as a bcrypt hash — it is printed once, at creation, and cannot be
-// recovered afterwards (regenerate with -new-password).
+// recovered afterwards. Change it with -new-password (random, printed once) or
+// -set-password (chosen, read from stdin); either way the file is read ONCE at
+// startup, so a running server must be restarted before the change takes effect.
 package auth
 
 import (
@@ -35,6 +37,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -53,10 +56,24 @@ const (
 	failMinWait = 250 * time.Millisecond
 
 	// Per-IP throttling alone is evaded by an attacker with many source addresses,
-	// so failures are ALSO capped globally. Set far above any human's fumbling but
-	// far below what makes a dictionary attack practical: at this rate a memorable
-	// password still takes years, while a legitimate user never notices it.
-	globalFailsPerMin = 30
+	// so failures are ALSO capped globally. Past the cap every attempt is SLOWED to
+	// globalThrottleWait rather than refused. Refusing was the obvious design and it
+	// is wrong: the owner's own login goes through the same door, so anyone willing
+	// to spend 30 POSTs a minute from a handful of addresses could lock the owner
+	// out of their own Mac indefinitely — a worse outcome than a slow login.
+	//
+	// Slowing down still bounds the attack, because verification is serialized
+	// (verifyMu) and every attempt holds that slot for its full wait: the ceiling is
+	// one guess per wait across ALL clients, however many connections or source
+	// addresses the attacker opens. At 2s that is ~30 guesses/minute — a memorable
+	// password still takes years — while the owner waits two seconds.
+	globalFailsPerMin  = 30
+	globalThrottleWait = 2 * time.Second
+
+	// minPasswordLen is the floor -set-password nags below (it never refuses). It is
+	// the same number the warning text recommends — a threshold that disagrees with
+	// its own advice silently passes everything in between.
+	minPasswordLen = 16
 )
 
 // stored is the on-disk secret file (mode 0600).
@@ -76,6 +93,16 @@ type Auth struct {
 	fails        map[string]*attempts
 	globalFails  int
 	globalWindow time.Time
+
+	// verifyMu serializes password checks so the waits below are a real ceiling on
+	// guesses per minute and not merely a per-request delay an attacker can hide
+	// behind concurrency. Never held while mu is held.
+	verifyMu sync.Mutex
+
+	// Fields, not constants, so tests can shrink them; production values come from
+	// failMinWait and globalThrottleWait.
+	failWait     time.Duration
+	throttleWait time.Duration
 }
 
 type attempts struct {
@@ -129,17 +156,25 @@ func Load(path string, regenerate bool) (a *Auth, newPassword string, err error)
 		return nil, "", fmt.Errorf("bad cookie_secret in %s: %w", path, err)
 	}
 	return &Auth{
-		hash:   []byte(s.PasswordHash),
-		token:  s.Token,
-		secret: secret,
-		fails:  map[string]*attempts{},
+		hash:         []byte(s.PasswordHash),
+		token:        s.Token,
+		secret:       secret,
+		fails:        map[string]*attempts{},
+		failWait:     failMinWait,
+		throttleWait: globalThrottleWait,
 	}, newPassword, nil
 }
 
 // SetPassword replaces the stored password with one the user chose, and rotates the
-// cookie secret so every existing session is invalidated — changing a password must
-// log out anyone already holding a session, including a stolen one. The host's
-// bearer token is left alone so a running session's own plumbing keeps working.
+// cookie secret so that existing sessions stop validating — changing a password must
+// log out anyone already holding a session, including a stolen one. The host's bearer
+// token is left alone so the local host process keeps its credential across the change.
+//
+// This writes the FILE. A server that is already running holds the old hash and old
+// cookie secret in memory and never re-reads them, so until it is restarted the old
+// password still works, the new one does not, and existing sessions stay valid.
+// Callers must say so — telling an owner who is rotating after a suspected theft that
+// they are safe, while the stolen session still works, is worse than saying nothing.
 //
 // Returns a human-readable warning when the password is weak enough to be worth
 // saying something about; it does not refuse (it is the owner's machine and call).
@@ -170,9 +205,11 @@ func SetPassword(path, password string) (warning string, err error) {
 		return "", err
 	}
 
-	if len(password) < 12 {
+	// RuneCountInString, not len: len is bytes, so a six-character non-ASCII
+	// passphrase measures 18 and would slip past a check meant to catch it.
+	if n := utf8.RuneCountInString(password); n < minPasswordLen {
 		warning = fmt.Sprintf("%d characters is short for an internet-facing gate on a tool "+
-			"that can type into this Mac; 16+ is a better floor.", len(password))
+			"that can type into this Mac; %d+ is a better floor.", n, minPasswordLen)
 	}
 	return warning, nil
 }
@@ -259,18 +296,13 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many attempts; wait a minute", http.StatusTooManyRequests)
 		return
 	}
-	if a.globallyThrottled() {
-		http.Error(w, "too many attempts server-wide; try again shortly", http.StatusTooManyRequests)
-		return
-	}
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 
-	if bcrypt.CompareHashAndPassword(a.hash, []byte(r.PostForm.Get("password"))) != nil {
+	if !a.verifyPassword(r.PostForm.Get("password")) {
 		a.recordFailure(ip)
-		time.Sleep(failMinWait) // blunt the request rate even before lockout
 		w.Header().Set("Cache-Control", "no-store")
 		http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
 		return
@@ -328,9 +360,29 @@ func (a *Auth) locked(ip string) (time.Duration, bool) {
 	return 0, false
 }
 
+// verifyPassword checks the password under a global rate limit: every attempt waits
+// its turn at verifyMu and holds it for a minimum delay, so guesses per minute are
+// bounded across ALL clients no matter how the load is spread across addresses.
+//
+// A correct password is never refused here — only slowed. That is the whole point of
+// throttling instead of rejecting: the throttle is reachable by any anonymous client,
+// so anything it refuses outright, an attacker can refuse on the owner's behalf.
+func (a *Auth) verifyPassword(password string) bool {
+	wait := a.failWait
+	if a.globallyThrottled() {
+		wait = a.throttleWait
+	}
+
+	a.verifyMu.Lock()
+	defer a.verifyMu.Unlock()
+	time.Sleep(wait) // before the check, not after, so it also paces successes
+	return bcrypt.CompareHashAndPassword(a.hash, []byte(password)) == nil
+}
+
 // globallyThrottled reports whether failures across ALL clients have exceeded the
-// per-minute cap. This is what makes a distributed guessing attack impractical when
-// the password is human-memorable rather than random.
+// per-minute cap, which is what makes a distributed guessing attack impractical when
+// the password is human-memorable rather than random. It selects a delay, not a
+// refusal — see verifyPassword.
 func (a *Auth) globallyThrottled() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
