@@ -11,9 +11,9 @@
 .gstack/
 
 # Personal notes / ops runbooks — never commit these to the public repo
-SPEC.md
-SETUP.md
-CLAUDE.md
+/SPEC.md
+/SETUP.md
+/CLAUDE.md
 *.local.md
 
 # Secrets (the server stores these in ~/.config/play/, but be explicit)

@@ -46,69 +46,88 @@ Mac — ONE Go binary + one Swift helper
   keyboard-lock relies on a Chrome-family API.
 - Optional, for remote access: a domain on Cloudflare and `cloudflared`.
 
-## Quick start (local network)
+## Quick start
+
+Full detail in **[docs/INSTALL.md](docs/INSTALL.md)** — this is the short version.
 
 ```sh
+# 1. Toolchain (Homebrew required)
 brew install go opus
+xcode-select --install
+
+# 2. Clone and verify your machine has everything
 git clone https://github.com/yizhifang123/Mac-Web-RemoteControl.git
 cd Mac-Web-RemoteControl
+./dev.sh doctor
+
+# 3. Build
 ./dev.sh build
-```
 
-Then run it. On first run it generates a password and prints it **once**:
+# 4. Smoke test — synthetic video + tone, needs NO macOS permissions
+./dev.sh run -source screen-test
 
-```sh
+# 5. The real thing
 ./dev.sh run -allow-input
 ```
 
-Open `http://127.0.0.1:9000` and sign in. To reach it from another device on your
-network while testing, bind wider — read the warning in
-[docs/SECURITY.md](docs/SECURITY.md) first:
+`./dev.sh doctor` checks every prerequisite and prints the exact command to fix
+whatever is missing. Start there if anything goes wrong.
 
-```sh
-./dev.sh run -allow-input -addr 0.0.0.0:9000
-```
+The first run prints a password **once** — save it. Only a bcrypt hash is stored, so it
+cannot be recovered (`-new-password` generates a new one, `-set-password` sets your own).
 
-macOS will ask for **Screen Recording** and **Accessibility** permission for
-`bin/capture` the first time. Both are required: the first to see the screen, the
-second to inject input.
+Then open <http://127.0.0.1:9000> and sign in.
 
-> Testing remote control against the same Mac you are typing on is confusing — the
-> video mirrors itself and your input fights the injected input. Drive it from a
-> second device.
+**macOS will ask for two permissions**, both for `bin/capture`: **Screen Recording** to
+see the screen, and **Accessibility** to inject input. If the prompts don't appear —
+common for command-line binaries — add `bin/capture` by full path in System Settings →
+Privacy & Security, then restart the server. macOS only re-reads permissions at start.
+
+> Testing remote control on the same Mac you're typing on is confusing: the video
+> mirrors itself and your input fights the injected input. Use a second device. To
+> reach it from your LAN, run with `-addr 0.0.0.0:9000` — and read
+> [docs/SECURITY.md](docs/SECURITY.md) before leaving it that way.
 
 ### Useful flags
 
 | Flag | Meaning |
 |---|---|
-| *(none)* | **View-only** — no input channel is even created |
+| *(none)* | **View-only** — the input channel is never even created |
 | `-allow-input` | Enable mouse/keyboard control |
 | `-input-dry` | Decode and log input but inject nothing (safe testing) |
 | `-width 1920` | Capture width; height follows your display's aspect |
 | `-fps 60` | Frame rate |
 | `-bitrate 15000000` | Encoder bitrate in bits/sec |
 | `-audio=false` | Disable the audio track |
-| `-source screen-test` | Synthetic video + tone — no permissions needed, good for debugging |
+| `-source screen-test` | Synthetic video + tone — no permissions needed |
+| `-addr 0.0.0.0:9000` | Bind for LAN testing (read the security docs first) |
 | `-set-password` | Read a new password from stdin and exit |
 | `-new-password` | Generate a random password, print it, and exit |
 
-## Remote access
+## Hosting it on your own domain
 
-Media is peer-to-peer, but the signaling handshake needs to be reachable. A Cloudflare
-Tunnel is the recommended route because it needs **no inbound ports and no static IP**.
-See **[docs/TUNNEL.md](docs/TUNNEL.md)** for the full walkthrough.
+Media is peer-to-peer, but the signaling handshake has to be reachable. A **Cloudflare
+Tunnel** is the recommended route: no port forwarding, no static IP, nothing exposed on
+your router.
+
+**[docs/TUNNEL.md](docs/TUNNEL.md)** is a complete walkthrough — creating the tunnel,
+the ingress config, DNS, and verifying it's actually locked down.
 
 Whatever you use, the rules that matter: keep the server bound to `127.0.0.1`, put the
 tunnel in front, and never disable the password gate on a network-reachable bind.
 
 ## Documentation
 
+- **[docs/INSTALL.md](docs/INSTALL.md)** — step-by-step setup, macOS permissions, and
+  how to actually use it once running.
+- **[docs/TUNNEL.md](docs/TUNNEL.md)** — putting it on your own domain safely.
+- **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — black video, no audio, input
+  doing nothing, 502s, connection failures.
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how the pieces fit, the wire
   protocols, and why certain non-obvious choices were made.
 - **[docs/SECURITY.md](docs/SECURITY.md)** — the threat model. **Read this before
   exposing anything.** This tool types into your Mac; that makes it remote code
   execution by design.
-- **[docs/TUNNEL.md](docs/TUNNEL.md)** — putting it on the internet safely.
 
 ## Honest limitations
 
