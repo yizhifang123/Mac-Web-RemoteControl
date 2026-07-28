@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mac Remote</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0b0d; color: #e8e8ea;
+               font: 14px system-ui, sans-serif; }
+  #stage { position: relative; width: 100%; height: 100%;
+           display: flex; align-items: center; justify-content: center; }
+  video { max-width: 100%; max-height: 100%; background: #000; }
+  #hud { position: fixed; top: 8px; left: 8px; padding: 6px 10px;
+         background: rgba(0,0,0,.6); border-radius: 6px;
+         font-variant-numeric: tabular-nums; }
+  #hud b { color: #8ad; }
+  #ctl { position: fixed; bottom: 8px; left: 8px; padding: 6px 10px;
+         background: rgba(0,0,0,.6); border-radius: 6px; }
+  #ctl b { color: #6d6; }
+  #ctl button { background: #222; color: #e8e8ea; border: 1px solid #444;
+                border-radius: 4px; padding: 2px 8px; font: inherit; cursor: pointer; }
+  #ctl button.on { background: #264; border-color: #3c6; }
+  #ctl input[type=range] { width: 80px; vertical-align: middle; }
+  .live { outline: 2px solid #3c6; }
+</style>
+</head>
+<body>
+  <div id="stage"><video id="v" autoplay playsinline muted></video></div>
+  <div id="hud">ws:<b id="ws">…</b> · pc:<b id="pc">…</b> · ice:<b id="ice">…</b> · <span id="stat">…</span></div>
+  <div id="ctl"><button id="mute" title="toggle audio">🔇</button> ·
+    input:<b id="ctl-state">unavailable</b><span id="ctl-opts" hidden>
+    · <button id="mode-desk" class="on">Desktop</button><button id="mode-game">Game</button>
+    · sens <input id="sens" type="range" min="0.2" max="3" step="0.1" value="1"><b id="sens-v">1.0</b></span></div>
+<script>
+const $ = id => document.getElementById(id);
+const v = $('v');
+// Autoplay policy forces the <video> to start muted; unmuting is a user gesture.
+$('mute').addEventListener('click', () => {
+  v.muted = !v.muted;
+  $('mute').textContent = v.muted ? '🔇' : '🔊';
+});
+const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+const ws = new WebSocket(`${proto}://${location.host}/ws?role=client`);
+let pc;
+
+function setup() {
+  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pc.onicecandidate = e => {
+    if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
+  };
+  pc.ontrack = e => { v.srcObject = e.streams[0]; $('stat').textContent = 'track received'; };
+  pc.oniceconnectionstatechange = () => $('ice').textContent = pc.iceConnectionState;
+  pc.onconnectionstatechange = () => $('pc').textContent = pc.connectionState;
+  // The host creates the "input" data channel only when control is enabled; a
+  // view-only session never sees one.
+  pc.ondatachannel = e => { if (e.channel.label === 'input') setupInput(e.channel); };
+}
+
+// ---- Input control (Phase 3/4): explicit engage/release, two modes ----
+// Desktop: click video to control, absolute coords, Esc releases.
+// Game (Phase 4): click video → fullscreen + keyboard lock + pointer lock, relative
+// deltas. Esc is FORWARDED to the Mac (Roblox menu); press-and-HOLD Esc uses the
+// browser's built-in gesture to exit pointer lock, which releases control here.
+let input = null, engaged = false, mode = 'desk';
+
+function setupInput(channel) {
+  input = channel;
+  $('ctl-state').textContent = 'available — click video to control';
+  $('ctl-opts').hidden = false;
+
+  const send = o => { if (input && input.readyState === 'open' && engaged) input.send(JSON.stringify(o)); };
+  // Absolute modifier state carried on every event, so a dropped keyup can't leave a
+  // modifier stuck (the classic "every 'a' becomes Cmd+A / clicks act as Cmd+click").
+  const mods = e => (e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.altKey ? 4 : 0) | (e.metaKey ? 8 : 0);
+
+  // Map a client point to normalized 0..1 within the actual video content rect,
+  // accounting for letterboxing (the video keeps aspect ratio inside the element).
+  const norm = e => {
+    const r = v.getBoundingClientRect();
+    const vw = v.videoWidth || 16, vh = v.videoHeight || 9;
+    const scale = Math.min(r.width / vw, r.height / vh);
+    const dw = vw * scale, dh = vh * scale;
+    const ox = r.left + (r.width - dw) / 2, oy = r.top + (r.height - dh) / 2;
+    return {
+      x: Math.max(0, Math.min(1, (e.clientX - ox) / dw)),
+      y: Math.max(0, Math.min(1, (e.clientY - oy) / dh)),
+    };
+  };
+
+  const sens = () => parseFloat($('sens').value);
+  $('sens').addEventListener('input', () => $('sens-v').textContent = sens().toFixed(1));
+
+  const engage = () => {
+    engaged = true; v.classList.add('live');
+    $('ctl-state').textContent = mode === 'game'
+      ? 'GAME — hold Esc to release' : 'CONTROLLING — Esc to release';
+  };
+  const release = () => {
+    if (engaged) send({ t: 'x' });
+    engaged = false; v.classList.remove('live');
+    $('ctl-state').textContent = 'available — click video to control';
+    if (document.pointerLockElement) document.exitPointerLock();
+    if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  };
+
+  const setMode = m => {
+    if (mode === m) return;
+    release();
+    mode = m;
+    $('mode-desk').classList.toggle('on', m === 'desk');
+    $('mode-game').classList.toggle('on', m === 'game');
+  };
+  $('mode-desk').addEventListener('click', () => setMode('desk'));
+  $('mode-game').addEventListener('click', () => setMode('game'));
+
+  // Game engage: each step is best-effort. Keyboard lock needs fullscreen (and only
+  // Chrome-family browsers have it); pointer lock is the one that actually matters.
+  // engage() fires from the pointerlockchange handler once the lock lands.
+  const engageGame = async () => {
+    try { await document.documentElement.requestFullscreen(); } catch {}
+    try { await navigator.keyboard.lock(); } catch {}
+    try {
+      const p = v.requestPointerLock({ unadjustedMovement: true });
+      if (p && p.catch) await p.catch(() => v.requestPointerLock());
+    } catch { v.requestPointerLock(); } // older API: options arg throws
+  };
+
+  v.addEventListener('click', () => { if (!engaged) (mode === 'game' ? engageGame() : engage()); });
+  v.addEventListener('contextmenu', e => e.preventDefault());
+
+  document.addEventListener('pointerlockchange', () => {
+    if (document.pointerLockElement === v) engage();
+    else if (engaged && mode === 'game') release(); // hold-Esc or focus loss ended the lock
+  });
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && engaged && mode === 'game') release();
+  });
+
+  // Game deltas accumulate between sends so the ~120 Hz cap drops packets, not motion.
+  let lastMove = 0, accX = 0, accY = 0;
+  v.addEventListener('mousemove', e => {
+    if (!engaged) return;
+    const now = performance.now();
+    if (mode === 'game') {
+      accX += e.movementX * sens(); accY += e.movementY * sens();
+      if (now - lastMove < 8) return;
+      lastMove = now;
+      if (accX || accY) { send({ t: 'r', dx: accX, dy: accY, f: mods(e) }); accX = accY = 0; }
+      return;
+    }
+    if (now - lastMove < 8) return; // ~120 Hz cap
+    lastMove = now;
+    const p = norm(e); send({ t: 'm', x: p.x, y: p.y, f: mods(e) });
+  });
+  v.addEventListener('mousedown', e => {
+    if (!engaged) return;
+    e.preventDefault();
+    if (mode === 'game') { send({ t: 'D', b: e.button, f: mods(e) }); return; }
+    const p = norm(e); send({ t: 'd', b: e.button, x: p.x, y: p.y, f: mods(e) });
+  });
+  window.addEventListener('mouseup', e => { if (engaged) send({ t: 'u', b: e.button, f: mods(e) }); });
+  v.addEventListener('wheel', e => { if (!engaged) return; e.preventDefault(); send({ t: 'w', dx: e.deltaX, dy: e.deltaY, f: mods(e) }); }, { passive: false });
+
+  window.addEventListener('keydown', e => {
+    // Desktop: Esc releases locally, never forwarded. Game: Esc goes to the Mac
+    // (in-game menu); releasing is the hold-Esc pointer-lock exit handled above.
+    if (e.key === 'Escape' && mode === 'desk') { release(); return; }
+    if (!engaged) return;
+    e.preventDefault();
+    send({ t: 'k', c: e.code, f: mods(e) });
+  });
+  window.addEventListener('keyup', e => { if (engaged) { e.preventDefault(); send({ t: 'K', c: e.code, f: mods(e) }); } });
+  // Leaving the page/window releases everything so nothing stays stuck on the host.
+  window.addEventListener('blur', release);
+}
+
+ws.onopen  = () => $('ws').textContent = 'open';
+ws.onclose = () => $('ws').textContent = 'closed';
+ws.onerror = () => $('ws').textContent = 'error';
+
+ws.onmessage = async ev => {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === 'offer') {
+    if (!pc) setup();
+    await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+    await pc.setLocalDescription(await pc.createAnswer());
+    ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
+    $('stat').textContent = 'answered offer';
+  } else if (msg.type === 'candidate') {
+    try { await pc.addIceCandidate(msg.candidate); } catch (e) { console.warn('addIceCandidate', e); }
+  } else if (msg.type === 'peer-disconnected') {
+    $('stat').textContent = 'host disconnected';
+    if (pc) { pc.close(); pc = null; }
+  }
+};
+
+// HUD: show decoded frames / bytes so the pipe is observable (and QA-checkable).
+setInterval(async () => {
+  if (!pc) return;
+  const stats = await pc.getStats();
+  stats.forEach(r => {
+    if (r.type === 'inbound-rtp' && r.kind === 'video') {
+      $('stat').textContent = `frames:${r.framesDecoded || 0} bytes:${r.bytesReceived || 0}`;
+    }
+  });
+}, 1000);
+</script>
+</body>
+</html>

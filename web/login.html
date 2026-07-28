@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mac Remote — sign in</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0b0d; color: #e8e8ea;
+               font: 15px system-ui, sans-serif; }
+  main { height: 100%; display: flex; align-items: center; justify-content: center; }
+  form { width: min(320px, 86vw); padding: 24px; background: #141419;
+         border: 1px solid #26262e; border-radius: 10px; }
+  h1 { margin: 0 0 4px; font-size: 17px; }
+  p  { margin: 0 0 18px; color: #8a8a95; font-size: 13px; }
+  label { display: block; margin-bottom: 6px; font-size: 13px; color: #b9b9c4; }
+  input { width: 100%; box-sizing: border-box; padding: 9px 10px; font: inherit;
+          color: #e8e8ea; background: #0b0b0d; border: 1px solid #33333d;
+          border-radius: 6px; }
+  input:focus { outline: none; border-color: #3c6; }
+  button { width: 100%; margin-top: 14px; padding: 9px; font: inherit; font-weight: 600;
+           color: #05170d; background: #3c6; border: 0; border-radius: 6px; cursor: pointer; }
+  button:hover { background: #4d7; }
+  .err { display: none; margin-top: 14px; padding: 8px 10px; border-radius: 6px;
+         background: #2a1417; border: 1px solid #5c2630; color: #f2a7b0; font-size: 13px; }
+  .err.show { display: block; }
+</style>
+</head>
+<body>
+  <main>
+    <form method="POST" action="/login">
+      <h1>Mac Remote</h1>
+      <p>This session can control the Mac. Sign in to continue.</p>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password"
+             autofocus required>
+      <button type="submit">Sign in</button>
+      <div class="err" id="err">Incorrect password.</div>
+    </form>
+  </main>
+<script>
+  // The server redirects back here with ?error=1 rather than echoing anything typed.
+  if (new URLSearchParams(location.search).has('error')) {
+    document.getElementById('err').classList.add('show');
+  }
+</script>
+</body>
+</html>

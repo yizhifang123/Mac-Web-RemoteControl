@@ -1,0 +1,21 @@
+# build artifacts
+/bin/
+
+# generated test media (regenerable via ./dev.sh media)
+/media/*.ivf
+/media/*.h264
+/media/*.mp4
+
+# macOS
+.DS_Store
+.gstack/
+
+# Personal notes / ops runbooks — never commit these to the public repo
+SPEC.md
+SETUP.md
+CLAUDE.md
+*.local.md
+
+# Secrets (the server stores these in ~/.config/play/, but be explicit)
+config.json
+*.pem
