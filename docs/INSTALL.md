@@ -136,8 +136,8 @@ hostname with no open inbound ports.
 ```sh
 ./dev.sh run                            # view-only — no input channel exists at all
 ./dev.sh run -allow-input               # enable control
-./dev.sh run -allow-input -width 1920   # higher resolution (height follows your display)
-./dev.sh run -allow-input -fps 60 -bitrate 15000000
+./dev.sh run -allow-input -width 1280   # lighter on a slow link (default is 1920)
+./dev.sh run -allow-input -fps 60 -bitrate 20000000
 ./dev.sh run -audio=false               # video only
 ./dev.sh run -set-password              # change the password (stdin; then restart)
 ```

@@ -13,7 +13,7 @@
 //
 // Usage:
 //   capture --source test   --framing raw --fps 30 --bitrate 4000000 > out.h264
-//   capture --source screen --framing length --width 1280 --height 720 --fps 30
+//   capture --source screen --framing length --width 1920 --height 1080 --fps 30
 
 import Foundation
 import Dispatch
@@ -71,10 +71,12 @@ extension Data {
 // MARK: - args
 
 struct AppConfig {
-    var width = 1280
-    var height = 720
+    var width = 1920
+    var height = 1080
     var fps = 30
-    var bitrate = 8_000_000
+    // Kept in step with the Go host's default (internal/host/host.go); the helper is
+    // normally launched with explicit flags, so these only apply when it is run by hand.
+    var bitrate = 12_000_000
     var gopSeconds = 2.0
     var bframes = false
     var source = "test"     // test | screen

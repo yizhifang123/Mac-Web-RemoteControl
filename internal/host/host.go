@@ -59,10 +59,13 @@ func BindFlags(fs *flag.FlagSet) func() Config {
 	source := fs.String("source", "screen", "video source: screen (live) | screen-test (synthetic H.264) | test (VP8 file)")
 	mediaPath := fs.String("media", "media/testsrc.ivf", "VP8 IVF file to loop (source=test)")
 	capturePath := fs.String("capture", "bin/capture", "path to the Swift capture helper (source=screen*)")
-	width := fs.Int("width", 1280, "capture width (height follows the display's aspect)")
-	height := fs.Int("height", 720, "capture height (overridden to match display aspect on source=screen)")
+	width := fs.Int("width", 1920, "capture width (height follows the display's aspect)")
+	height := fs.Int("height", 1080, "capture height (overridden to match display aspect on source=screen)")
 	fps := fs.Int("fps", 30, "capture frame rate")
-	bitrate := fs.Int("bitrate", 8_000_000, "encoder bitrate (bits/sec)")
+	// Scaled with the 1280→1920 default: 8 Mbps was tuned for 720p-class frames and
+	// leaves 1080p-class ones soft on motion and small text, which is most of what
+	// this gets used for.
+	bitrate := fs.Int("bitrate", 12_000_000, "encoder bitrate (bits/sec)")
 	gop := fs.Float64("gop", 2.0, "keyframe interval (seconds)")
 	bframes := fs.Bool("bframes", false, "allow B-frames (higher latency; Movie preset)")
 	audio := fs.Bool("audio", true, "capture system audio as an Opus track (screen sources)")

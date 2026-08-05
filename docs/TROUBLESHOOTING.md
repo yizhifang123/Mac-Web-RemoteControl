@@ -36,10 +36,12 @@ rejected the stream. Try Chrome. Confirm the pipeline itself is fine with
 doesn't, the issue is capture, not decode.
 
 **Video is laggy or stuttery**
-Lower the bitrate to fit your uplink (`-bitrate 4000000`), or drop the resolution
-(`-width 1280`). There's no adaptive bitrate yet, so a link that can't sustain the
-configured rate stutters rather than degrading gracefully. Latency problems are almost
-never bandwidth — they're buffering.
+Lower the bitrate to fit your uplink (`-bitrate 6000000`), or drop the resolution
+(`-width 1280`). The defaults are 1920 wide at 12 Mbps, which assumes a decent link —
+on a constrained network these are the first two knobs to turn down. There's no
+adaptive bitrate yet, so a link that can't sustain the configured rate stutters rather
+than degrading gracefully. Latency problems are almost never bandwidth — they're
+buffering.
 
 **The picture is letterboxed, or the cursor drifts further off the further you move**
 Something forced a mismatched aspect ratio. Set only `-width` and let height be derived

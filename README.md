@@ -24,8 +24,10 @@ Mac — ONE Go binary + one Swift helper
 
 ## What works
 
-- **Live screen** at 1280×N, H.264 via VideoToolbox, hardware-encoded, low latency.
-  Capture height is derived from your display's aspect ratio automatically.
+- **Live screen** at 1920×N by default, H.264 via VideoToolbox, hardware-encoded, low
+  latency. Capture height is derived from your display's aspect ratio automatically, so
+  the second number depends on your screen — a 16:10 laptop panel gives you something
+  taller than 1080.
 - **System audio** as an Opus track (48 kHz stereo), so videos and games have sound.
 - **Mouse and keyboard injection** — click, drag, scroll, type, modifiers.
   **View-only is the default**; control requires an explicit flag.
@@ -97,9 +99,9 @@ Privacy & Security, then restart the server. macOS only re-reads permissions at 
 | *(none)* | **View-only** — the input channel is never even created |
 | `-allow-input` | Enable mouse/keyboard control |
 | `-input-dry` | Decode and log input but inject nothing (safe testing) |
-| `-width 1920` | Capture width; height follows your display's aspect |
-| `-fps 60` | Frame rate |
-| `-bitrate 15000000` | Encoder bitrate in bits/sec |
+| `-width 1280` | Capture width (default 1920); height follows your display's aspect |
+| `-fps 60` | Frame rate (default 30) |
+| `-bitrate 6000000` | Encoder bitrate in bits/sec (default 12000000) |
 | `-audio=false` | Disable the audio track |
 | `-source screen-test` | Synthetic video + tone — no permissions needed |
 | `-addr 0.0.0.0:9000` | Bind for LAN testing (read the security docs first) |
