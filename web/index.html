@@ -14,23 +14,21 @@
          background: rgba(0,0,0,.6); border-radius: 6px;
          font-variant-numeric: tabular-nums; }
   #hud b { color: #8ad; }
-  #ctl { position: fixed; bottom: 8px; left: 8px; padding: 6px 10px;
-         background: rgba(0,0,0,.6); border-radius: 6px; }
-  #ctl b { color: #6d6; }
-  #ctl button { background: #222; color: #e8e8ea; border: 1px solid #444;
-                border-radius: 4px; padding: 2px 8px; font: inherit; cursor: pointer; }
-  #ctl button.on { background: #264; border-color: #3c6; }
-  #ctl input[type=range] { width: 80px; vertical-align: middle; }
-  .live { outline: 2px solid #3c6; }
+  #ctl { position: fixed; bottom: 8px; left: 8px; }
+  #ctl button { background: rgba(0,0,0,.6); color: #e8e8ea; border: 1px solid #444;
+                border-radius: 6px; padding: 4px 8px; font: inherit; cursor: pointer; }
+  /* Clean view: the HUD is a connection-debugging aid — gone once the stream
+     is up (and while controlling), back if the connection degrades. */
+  body.connected #hud, body.engaged #hud { display: none; }
 </style>
 </head>
 <body>
   <div id="stage"><video id="v" autoplay playsinline muted></video></div>
   <div id="hud">ws:<b id="ws">…</b> · pc:<b id="pc">…</b> · ice:<b id="ice">…</b> · <span id="stat">…</span></div>
-  <div id="ctl"><button id="mute" title="toggle audio">🔇</button> ·
-    input:<b id="ctl-state">unavailable</b><span id="ctl-opts" hidden>
-    · <button id="mode-desk" class="on">Desktop</button><button id="mode-game">Game</button>
-    · sens <input id="sens" type="range" min="0.2" max="3" step="0.1" value="1"><b id="sens-v">1.0</b></span></div>
+  <!-- The only on-screen control. Everything else (modes, sensitivity, input
+       status) was deliberately stripped: click video to control, G toggles
+       Desktop/Game mode while not controlling, Esc releases. -->
+  <div id="ctl"><button id="mute" title="toggle audio">🔇</button></div>
 <script>
 const $ = id => document.getElementById(id);
 const v = $('v');
@@ -50,7 +48,12 @@ function setup() {
   };
   pc.ontrack = e => { v.srcObject = e.streams[0]; $('stat').textContent = 'track received'; };
   pc.oniceconnectionstatechange = () => $('ice').textContent = pc.iceConnectionState;
-  pc.onconnectionstatechange = () => $('pc').textContent = pc.connectionState;
+  pc.onconnectionstatechange = () => {
+    $('pc').textContent = pc.connectionState;
+    // HUD is a connection-debugging aid: gone while the stream is healthy,
+    // back the moment the connection degrades.
+    document.body.classList.toggle('connected', pc.connectionState === 'connected');
+  };
   // The host creates the "input" data channel only when control is enabled; a
   // view-only session never sees one.
   pc.ondatachannel = e => { if (e.channel.label === 'input') setupInput(e.channel); };
@@ -65,8 +68,6 @@ let input = null, engaged = false, mode = 'desk';
 
 function setupInput(channel) {
   input = channel;
-  $('ctl-state').textContent = 'available — click video to control';
-  $('ctl-opts').hidden = false;
 
   const send = o => { if (input && input.readyState === 'open' && engaged) input.send(JSON.stringify(o)); };
   // Absolute modifier state carried on every event, so a dropped keyup can't leave a
@@ -87,18 +88,12 @@ function setupInput(channel) {
     };
   };
 
-  const sens = () => parseFloat($('sens').value);
-  $('sens').addEventListener('input', () => $('sens-v').textContent = sens().toFixed(1));
-
   const engage = () => {
-    engaged = true; v.classList.add('live');
-    $('ctl-state').textContent = mode === 'game'
-      ? 'GAME — hold Esc to release' : 'CONTROLLING — Esc to release';
+    engaged = true; document.body.classList.add('engaged');
   };
   const release = () => {
     if (engaged) send({ t: 'x' });
-    engaged = false; v.classList.remove('live');
-    $('ctl-state').textContent = 'available — click video to control';
+    engaged = false; document.body.classList.remove('engaged');
     if (document.pointerLockElement) document.exitPointerLock();
     if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -108,11 +103,7 @@ function setupInput(channel) {
     if (mode === m) return;
     release();
     mode = m;
-    $('mode-desk').classList.toggle('on', m === 'desk');
-    $('mode-game').classList.toggle('on', m === 'game');
   };
-  $('mode-desk').addEventListener('click', () => setMode('desk'));
-  $('mode-game').addEventListener('click', () => setMode('game'));
 
   // Game engage: each step is best-effort. Keyboard lock needs fullscreen (and only
   // Chrome-family browsers have it); pointer lock is the one that actually matters.
@@ -143,7 +134,7 @@ function setupInput(channel) {
     if (!engaged) return;
     const now = performance.now();
     if (mode === 'game') {
-      accX += e.movementX * sens(); accY += e.movementY * sens();
+      accX += e.movementX; accY += e.movementY;
       if (now - lastMove < 8) return;
       lastMove = now;
       if (accX || accY) { send({ t: 'r', dx: accX, dy: accY, f: mods(e) }); accX = accY = 0; }
@@ -166,7 +157,8 @@ function setupInput(channel) {
     // Desktop: Esc releases locally, never forwarded. Game: Esc goes to the Mac
     // (in-game menu); releasing is the hold-Esc pointer-lock exit handled above.
     if (e.key === 'Escape' && mode === 'desk') { release(); return; }
-    if (!engaged) return;
+    // No mode buttons on screen: G (while not controlling) flips Desktop/Game.
+    if (!engaged) { if (e.code === 'KeyG') setMode(mode === 'desk' ? 'game' : 'desk'); return; }
     e.preventDefault();
     send({ t: 'k', c: e.code, f: mods(e) });
   });
@@ -191,6 +183,7 @@ ws.onmessage = async ev => {
     try { await pc.addIceCandidate(msg.candidate); } catch (e) { console.warn('addIceCandidate', e); }
   } else if (msg.type === 'peer-disconnected') {
     $('stat').textContent = 'host disconnected';
+    document.body.classList.remove('connected'); // close() won't fire the state event
     if (pc) { pc.close(); pc = null; }
   }
 };
