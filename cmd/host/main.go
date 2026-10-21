@@ -22,6 +22,7 @@ func main() {
 
 	cfg := hostConfig()
 	cfg.SignalURL = *signalURL
+	// cfg.ICEServers stays nil (STUN-only); TURN wiring lives in cmd/play.
 	// Read the same secrets file the server uses, to authenticate to it.
 	if gate, _, err := auth.Load(*configPath, false); err == nil {
 		cfg.Token = gate.Token()

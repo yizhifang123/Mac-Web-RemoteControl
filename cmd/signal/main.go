@@ -41,7 +41,9 @@ func main() {
 	log.Printf("signaling + client on http://%s", ln.Addr())
 	signaling.LogBindHints(*addr)
 
-	if err := signaling.Serve(ctx, ln, play.WebRoot(*webDir), gate); err != nil && ctx.Err() == nil {
+	// nil ICE fetcher: /ice-servers serves the STUN-only fallback. TURN wiring
+	// lives in cmd/play, the normal way to run the remote desktop.
+	if err := signaling.Serve(ctx, ln, play.WebRoot(*webDir), gate, nil); err != nil && ctx.Err() == nil {
 		log.Fatalf("signaling: %v", err)
 	}
 }

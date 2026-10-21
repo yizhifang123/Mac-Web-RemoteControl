@@ -20,17 +20,19 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/pion/webrtc/v4"
+	"github.com/yizhifang123/Mac-Web-RemoteControl/internal/ice"
 )
 
 // sigMsg is the tiny signaling protocol. Offer/answer carry SDP; candidate carries a
-// raw ICECandidateInit forwarded verbatim by the server.
+// raw ICECandidateInit forwarded verbatim by the server. Message rides on
+// type:"error", the host telling the viewer why its session just ended (the server
+// relays it to the browser like everything else).
 type sigMsg struct {
 	Type      string          `json:"type"`
 	SDP       string          `json:"sdp,omitempty"`
 	Candidate json.RawMessage `json:"candidate,omitempty"`
+	Message   string          `json:"message,omitempty"`
 }
-
-var stun = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 
 // Config is everything the host needs to run its session loop.
 type Config struct {
@@ -39,6 +41,12 @@ type Config struct {
 	Source      string // screen | screen-test | test
 	MediaPath   string // VP8 IVF file, source=test only
 	CapturePath string // Swift capture helper, source=screen*
+
+	// ICEServers supplies the servers for each new peer connection — TURN
+	// credentials when cmd/play has a Cloudflare TURN key configured. Nil means
+	// the built-in STUN-only default. Like SignalURL this is set by the cmd, not a
+	// flag: cmd/play wires in its own minting provider, cmd/host stays STUN-only.
+	ICEServers func(context.Context) []webrtc.ICEServer
 
 	Width, Height, FPS, Bitrate int
 	GOPSeconds                  float64
@@ -108,8 +116,14 @@ func Run(ctx context.Context, cfg Config) error {
 	log.Printf("host video source: %s (%s), %s", cfg.Source, src.codec().MimeType, control)
 
 	enableInput := inputMode != "off"
+
+	// The session holder lives out here, OUTSIDE the reconnect loop, on purpose: a
+	// media session must survive losing the signaling socket. See sessionHolder.
+	var sessions sessionHolder
+	defer sessions.end()
+
 	for {
-		if err := connectAndServe(ctx, hostURL, cfg.Token, src, enableInput); err != nil {
+		if err := connectAndServe(ctx, hostURL, cfg.Token, src, enableInput, cfg.ICEServers, &sessions); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -150,9 +164,10 @@ func withRole(raw, role string) (string, error) {
 	return u.String(), nil
 }
 
-// connectAndServe dials signaling and runs one connection's lifetime, driving at most
-// one media session at a time (started on "ready", torn down on peer loss).
-func connectAndServe(ctx context.Context, url, token string, src frameSource, allowInput bool) error {
+// connectAndServe dials signaling and runs one connection's lifetime. The media
+// session it drives is owned by sessions, which outlives this call: returning from
+// here means the signaling socket died, and that is not a reason to stop streaming.
+func connectAndServe(ctx context.Context, url, token string, src frameSource, allowInput bool, iceServers func(context.Context) []webrtc.ICEServer, sessions *sessionHolder) error {
 	var opts *websocket.DialOptions
 	if token != "" {
 		// The host authenticates like any other client — no loopback exemption.
@@ -173,21 +188,8 @@ func connectAndServe(ctx context.Context, url, token string, src frameSource, al
 		return ws.Write(wctx, websocket.MessageText, data)
 	}
 
-	var mu sync.Mutex
-	var sess *session
-
-	endSession := func() {
-		mu.Lock()
-		s := sess
-		sess = nil
-		mu.Unlock()
-		if s != nil {
-			s.close()
-		}
-	}
-	defer endSession()
-
-	current := func() *session { mu.Lock(); defer mu.Unlock(); return sess }
+	// NOTE: deliberately no `defer sessions.end()`. Losing signaling must leave a
+	// working stream alone — the browser keeps its video while this loop redials.
 
 	for {
 		_, data, err := ws.Read(ctx)
@@ -201,17 +203,17 @@ func connectAndServe(ctx context.Context, url, token string, src frameSource, al
 		}
 		switch m.Type {
 		case "ready":
-			endSession() // start fresh for a (re)connecting browser
-			s, err := newSession(ctx, src, allowInput, send)
+			// The browser asked for a stream. End any current one FIRST — the source
+			// can only feed one session at a time — then build the replacement.
+			sessions.end()
+			s, err := newSession(ctx, src, allowInput, send, iceServers, sessions)
 			if err != nil {
 				log.Printf("session start failed: %v", err)
 				continue
 			}
-			mu.Lock()
-			sess = s
-			mu.Unlock()
+			sessions.set(s)
 		case "answer":
-			if s := current(); s != nil {
+			if s := sessions.get(); s != nil {
 				if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{
 					Type: webrtc.SDPTypeAnswer, SDP: m.SDP,
 				}); err != nil {
@@ -219,7 +221,7 @@ func connectAndServe(ctx context.Context, url, token string, src frameSource, al
 				}
 			}
 		case "candidate":
-			if s := current(); s != nil && len(m.Candidate) > 0 {
+			if s := sessions.get(); s != nil && len(m.Candidate) > 0 {
 				var init webrtc.ICECandidateInit
 				if err := json.Unmarshal(m.Candidate, &init); err == nil {
 					if err := s.pc.AddICECandidate(init); err != nil {
@@ -228,8 +230,13 @@ func connectAndServe(ctx context.Context, url, token string, src frameSource, al
 				}
 			}
 		case "peer-disconnected":
-			log.Printf("browser disconnected; tearing down session")
-			endSession()
+			// The browser's SIGNALING socket went away. That says nothing about the
+			// media path, which is peer-to-peer (or relayed) and never touches this
+			// connection. Tearing down here is what killed a healthy stream every
+			// time an idle socket got reaped. If the browser is really gone, the peer
+			// connection fails on its own and the handler below cleans up; if it just
+			// reconnects, it keeps the video it already had.
+			log.Printf("browser signaling disconnected; keeping the media session")
 		}
 	}
 }
@@ -244,15 +251,69 @@ func (s *session) close() {
 	_ = s.pc.Close()
 }
 
+// sessionHolder owns the at-most-one live media session, independently of any single
+// signaling connection. Media flows peer-to-peer or through TURN and does not touch
+// the signaling socket, so a signaling drop must never close it — conflating the two
+// was the ~5-minute disconnect.
+type sessionHolder struct {
+	mu   sync.Mutex
+	sess *session
+}
+
+func (h *sessionHolder) get() *session {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sess
+}
+
+// set installs s and closes whatever it replaced.
+func (h *sessionHolder) set(s *session) {
+	h.mu.Lock()
+	old := h.sess
+	h.sess = s
+	h.mu.Unlock()
+	if old != nil {
+		old.close()
+	}
+}
+
+func (h *sessionHolder) end() { h.set(nil) }
+
+// endIf closes s only if it is still the current session, so a late callback from a
+// peer connection that has already been replaced cannot kill its successor.
+func (h *sessionHolder) endIf(s *session) {
+	h.mu.Lock()
+	current := h.sess == s
+	if current {
+		h.sess = nil
+	}
+	h.mu.Unlock()
+	if current {
+		s.close()
+	}
+}
+
 // newSession builds the peer connection, attaches the source's video track, and sends
 // the offer. The host is the offerer so that in the real product it "publishes" to
 // whichever browser connects.
-func newSession(parent context.Context, src frameSource, allowInput bool, send func(any) error) (*session, error) {
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: stun})
+func newSession(parent context.Context, src frameSource, allowInput bool, send func(any) error, iceServers func(context.Context) []webrtc.ICEServer, sessions *sessionHolder) (*session, error) {
+	// Sessions come and go with browser reconnects, so the servers are fetched per
+	// session — the provider behind iceServers caches, so this is normally a lookup,
+	// not an HTTP round-trip.
+	servers := ice.Fallback()
+	if iceServers != nil {
+		servers = iceServers(parent)
+	}
+	api, err := newAPI()
+	if err != nil {
+		return nil, err
+	}
+	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: servers})
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(parent)
+	sess := &session{pc: pc, cancel: cancel}
 	fail := func(e error) (*session, error) { _ = pc.Close(); cancel(); return nil, e }
 
 	// Input data channel: created ONLY when input is enabled and the source can accept
@@ -264,9 +325,38 @@ func newSession(parent context.Context, src frameSource, allowInput bool, send f
 			return fail(derr)
 		}
 		dc.OnOpen(func() { log.Printf("input channel open") })
+		var seq moveSeq
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			// Sequenced moves (the browser's settle/pre-click re-send) share the move
+			// channel's sequence; everything else is a plain validated command.
+			if m, ok := decodeInput(msg.Data); ok && m.N > 0 {
+				if mv, fresh := seq.accept(m); fresh {
+					sink.writeMove(mv)
+				}
+				return
+			}
 			if line, ok := translateInput(msg.Data); ok {
 				sink.writeInput(line)
+			}
+		})
+
+		// Mouse moves get their own channel: unordered, never retransmitted. On the
+		// reliable channel one lost packet holds every later move (and key) until it
+		// is resent, then replays them all late. Here a lost move costs nothing: the
+		// next one carries the latest position, or the running totals (see moveSeq).
+		// Keys, clicks and wheel stay on "input", where losing one would be a bug.
+		unordered, noRetransmits := false, uint16(0)
+		mc, merr := pc.CreateDataChannel("move", &webrtc.DataChannelInit{
+			Ordered: &unordered, MaxRetransmits: &noRetransmits,
+		})
+		if merr != nil {
+			return fail(merr)
+		}
+		mc.OnMessage(func(msg webrtc.DataChannelMessage) {
+			if m, ok := decodeInput(msg.Data); ok && (m.T == "m" || m.T == "c") {
+				if mv, fresh := seq.accept(m); fresh {
+					sink.writeMove(mv)
+				}
 			}
 		})
 	}
@@ -279,7 +369,8 @@ func newSession(parent context.Context, src frameSource, allowInput bool, send f
 	if err != nil {
 		return fail(err)
 	}
-	drainRTCP(videoSender)
+	kf, _ := src.(keyframer)
+	readRTCPForKeyframes(videoSender, kf)
 
 	var audioTrack *webrtc.TrackLocalStaticSample
 	if src.hasAudio() {
@@ -303,7 +394,15 @@ func newSession(parent context.Context, src frameSource, allowInput bool, send f
 		switch st {
 		case webrtc.PeerConnectionStateConnected:
 			once.Do(func() { close(connected) })
-		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			logSelectedPath(pc)
+		case webrtc.PeerConnectionStateFailed:
+			// THIS is what ends a session: the media path itself is gone. (Note
+			// Disconnected is deliberately not handled — it is transient, and ICE
+			// recovers from it on its own.) Closing a peer connection from inside a
+			// pion state callback deadlocks, so hand it off to a goroutine.
+			cancel()
+			go sessions.endIf(sess)
+		case webrtc.PeerConnectionStateClosed:
 			cancel()
 		}
 	})
@@ -335,12 +434,18 @@ func newSession(parent context.Context, src frameSource, allowInput bool, send f
 		}
 		log.Printf("connected; streaming from source")
 		if err := src.stream(ctx, videoTrack, audioTrack); err != nil && ctx.Err() == nil {
+			// The source died under a live peer connection. Left alone, that is the
+			// black-screen session: connected, silent, showing nothing. Tell the
+			// viewer why (best-effort — the signaling socket may be mid-reconnect),
+			// then end the session so the browser's retry loop asks for a fresh one.
 			log.Printf("source stream error: %v", err)
+			_ = send(sigMsg{Type: "error", Message: err.Error()})
+			sessions.endIf(sess)
 		}
 	}()
 
 	log.Printf("session started; offer sent")
-	return &session{pc: pc, cancel: cancel}, nil
+	return sess, nil
 }
 
 // drainRTCP reads and discards a sender's RTCP so interceptors (NACK / receiver

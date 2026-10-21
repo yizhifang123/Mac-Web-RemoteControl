@@ -28,6 +28,12 @@ final class H264Encoder {
     private var lastPTS: CMTime = .invalid
     private let keyLock = NSLock()
     private var forceKeyframeNext = false
+    // Low-latency rate control sheds frames it cannot afford at the set bitrate, and
+    // it does so silently (the callback just gets no sample). Counted per 5 s window
+    // so a too-low -bitrate shows up in the log instead of as "it feels choppy".
+    private let statLock = NSLock()
+    private var statIn = 0, statDropped = 0, statKeyframes = 0
+    private var statSince = Date()
 
     init(config: Config, onFrame: @escaping (Data, UInt32) -> Void) throws {
         self.cfg = config
@@ -88,10 +94,23 @@ final class H264Encoder {
         keyLock.lock(); forceKeyframeNext = true; keyLock.unlock()
     }
 
+    private func count(dropped: Bool = false, keyframe: Bool = false, input: Bool = false) {
+        statLock.lock(); defer { statLock.unlock() }
+        if input { statIn += 1 }
+        if dropped { statDropped += 1 }
+        if keyframe { statKeyframes += 1 }
+        let secs = -statSince.timeIntervalSinceNow
+        guard input, secs >= 5 else { return }
+        logErr(String(format: "encoder: %.0f fps in, %d dropped by rate control, %d keyframes (last %.0fs)",
+                      Double(statIn) / secs, statDropped, statKeyframes, secs))
+        statIn = 0; statDropped = 0; statKeyframes = 0; statSince = Date()
+    }
+
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, duration: CMTime) {
         keyLock.lock(); let force = forceKeyframeNext; forceKeyframeNext = false; keyLock.unlock()
         var props: CFDictionary?
         if force { props = [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary }
+        count(input: true)
 
         let status = VTCompressionSessionEncodeFrame(
             session,
@@ -102,7 +121,8 @@ final class H264Encoder {
             infoFlagsOut: nil) { [weak self] status, _, sampleBuffer in
                 guard let self = self else { return }
                 if status != noErr { logErr("encode callback status \(status)"); return }
-                guard let sb = sampleBuffer else { return }
+                guard let sb = sampleBuffer else { self.count(dropped: true); return }
+                if self.isKeyframe(sb) { self.count(keyframe: true) }
                 self.emit(sb)
             }
         if status != noErr { logErr("encodeFrame status \(status)") }

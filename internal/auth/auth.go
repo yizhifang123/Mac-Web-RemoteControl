@@ -29,8 +29,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,6 +83,13 @@ type stored struct {
 	PasswordHash string `json:"password_hash"` // bcrypt; plaintext is never written
 	Token        string `json:"token"`         // bearer token for the local host process
 	CookieSecret string `json:"cookie_secret"` // HMAC key for session cookies
+
+	// Cloudflare TURN key for minting short-lived relay credentials.
+	// Optional: absent means STUN-only, so these are deliberately NOT
+	// part of Load's missing-fields check — an existing config without them must
+	// keep loading.
+	TurnKeyID    string `json:"turn_key_id,omitempty"`
+	TurnAPIToken string `json:"turn_api_token,omitempty"`
 }
 
 // Auth validates browser sessions and the host process's bearer token.
@@ -88,6 +97,9 @@ type Auth struct {
 	hash   []byte
 	token  string
 	secret []byte
+
+	turnKeyID    string
+	turnAPIToken string
 
 	mu           sync.Mutex
 	fails        map[string]*attempts
@@ -125,25 +137,39 @@ func DefaultConfigPath() string {
 func Load(path string, regenerate bool) (a *Auth, newPassword string, err error) {
 	var s stored
 	raw, readErr := os.ReadFile(path)
-	switch {
-	case readErr == nil && !regenerate:
+	if readErr == nil {
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return nil, "", fmt.Errorf("parse %s: %w", path, err)
+			if !regenerate {
+				return nil, "", fmt.Errorf("parse %s: %w", path, err)
+			}
+			// -new-password is the documented recovery path ("lost it? rerun with
+			// -new-password"), so a corrupt file must not stop it — start over.
+			log.Printf("auth: %s is unreadable (%v); regenerating from scratch — any stored TURN key is lost with it", path, err)
+			s = stored{}
 		}
-		if s.PasswordHash == "" || s.Token == "" || s.CookieSecret == "" {
-			return nil, "", fmt.Errorf("%s is missing fields; delete it to regenerate", path)
-		}
+	}
+	hasAnyCore := s.PasswordHash != "" || s.Token != "" || s.CookieSecret != ""
+	hasAllCore := s.PasswordHash != "" && s.Token != "" && s.CookieSecret != ""
+	switch {
+	case readErr == nil && !regenerate && hasAllCore:
+		// Complete config: use it as-is.
+	case readErr == nil && !regenerate && hasAnyCore:
+		// SOME core secrets but not all: a truncated or hand-edited file. Refuse
+		// rather than silently regenerate credentials the owner thinks are stable.
+		return nil, "", fmt.Errorf("%s is missing fields; delete it to regenerate", path)
 	case readErr == nil || errors.Is(readErr, os.ErrNotExist):
+		// No file, no core secrets (e.g. -set-turn-key ran before the first
+		// start), or -new-password: (re)generate the three core secrets. s keeps
+		// any optional settings already in the file (the TURN key) — regenerating
+		// a password must not silently drop them.
 		newPassword = randomSecret(12) // 96 bits
 		hash, herr := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
 		if herr != nil {
 			return nil, "", herr
 		}
-		s = stored{
-			PasswordHash: string(hash),
-			Token:        randomSecret(32),
-			CookieSecret: randomSecret(32),
-		}
+		s.PasswordHash = string(hash)
+		s.Token = randomSecret(32)
+		s.CookieSecret = randomSecret(32)
 		if err := write(path, s); err != nil {
 			return nil, "", err
 		}
@@ -159,6 +185,8 @@ func Load(path string, regenerate bool) (a *Auth, newPassword string, err error)
 		hash:         []byte(s.PasswordHash),
 		token:        s.Token,
 		secret:       secret,
+		turnKeyID:    s.TurnKeyID,
+		turnAPIToken: s.TurnAPIToken,
 		fails:        map[string]*attempts{},
 		failWait:     failMinWait,
 		throttleWait: globalThrottleWait,
@@ -214,6 +242,36 @@ func SetPassword(path, password string) (warning string, err error) {
 	return warning, nil
 }
 
+// SetTurnKey stores the Cloudflare TURN key used to mint short-lived relay
+// credentials, leaving every other secret untouched. Like SetPassword this writes
+// the FILE only: config is read once at startup, so a running server keeps serving
+// STUN-only until it is restarted — callers must say so.
+func SetTurnKey(path, keyID, apiToken string) (warning string, err error) {
+	if strings.TrimSpace(keyID) == "" || strings.TrimSpace(apiToken) == "" {
+		return "", errors.New("TURN key ID and API token are both required")
+	}
+
+	var s stored
+	if raw, rerr := os.ReadFile(path); rerr == nil {
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return "", fmt.Errorf("parse %s: %w", path, err)
+		}
+	} else if !errors.Is(rerr, os.ErrNotExist) {
+		return "", rerr
+	}
+
+	s.TurnKeyID = keyID
+	s.TurnAPIToken = apiToken
+	if err := write(path, s); err != nil {
+		return "", err
+	}
+
+	if s.PasswordHash == "" {
+		warning = "no password exists yet in this config; the server will generate one on first start."
+	}
+	return warning, nil
+}
+
 func write(path string, s stored) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
@@ -237,6 +295,10 @@ func randomSecret(n int) string {
 // Token is the bearer token the local host process uses to reach signaling.
 func (a *Auth) Token() string { return a.token }
 
+// TurnKey returns the stored Cloudflare TURN key. Both values are empty when TURN
+// was never configured; callers then serve the STUN-only fallback.
+func (a *Auth) TurnKey() (id, token string) { return a.turnKeyID, a.turnAPIToken }
+
 // Protect wraps next so nothing is reachable without a valid session or token.
 // loginPage is served (unauthenticated) at /login.
 func (a *Auth) Protect(next http.Handler, loginPage []byte) http.Handler {
@@ -246,7 +308,7 @@ func (a *Auth) Protect(next http.Handler, loginPage []byte) http.Handler {
 		switch r.Method {
 		case http.MethodGet:
 			if a.Authorized(r) {
-				http.Redirect(w, r, "/", http.StatusSeeOther)
+				http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusSeeOther)
 				return
 			}
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -267,6 +329,13 @@ func (a *Auth) Protect(next http.Handler, loginPage []byte) http.Handler {
 		// A WebSocket dialer cannot act on a redirect; fail it outright.
 		if isWebSocketUpgrade(r) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		// Carry where the browser was headed (path?query) through the login
+		// round-trip. Dropping it is not just an annoyance: losing ?relay would
+		// make a forced-relay test silently test the direct path instead.
+		if next := r.URL.RequestURI(); next != "/" && next != "" {
+			http.Redirect(w, r, "/login?next="+url.QueryEscape(next), http.StatusSeeOther)
 			return
 		}
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -304,7 +373,13 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !a.verifyPassword(r.PostForm.Get("password")) {
 		a.recordFailure(ip)
 		w.Header().Set("Cache-Control", "no-store")
-		http.Redirect(w, r, "/login?error=1", http.StatusSeeOther)
+		// Keep next through the retry, or a mistyped password quietly costs the
+		// destination even though the login form itself preserves it.
+		dest := "/login?error=1"
+		if next := r.URL.Query().Get("next"); next != "" {
+			dest += "&next=" + url.QueryEscape(next)
+		}
+		http.Redirect(w, r, dest, http.StatusSeeOther)
 		return
 	}
 
@@ -319,7 +394,27 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   requestIsHTTPS(r),    // set only when the browser used HTTPS
 		SameSite: http.SameSiteLaxMode, // blocks cross-site POSTs at the gate
 	})
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusSeeOther)
+}
+
+// safeNext validates a post-login destination. next rides the query string — i.e. it
+// comes from whoever crafted the link — so anything but a strictly-local path is an
+// open redirect: a phishing link could bounce a fresh login onto its own copy of the
+// page. Must start with "/" but not "//" or "/\" (browsers treat both as
+// protocol-relative), and carry no control bytes. Anything else falls back to "/".
+func safeNext(next string) string {
+	if next == "" || next[0] != '/' {
+		return "/"
+	}
+	if len(next) > 1 && (next[1] == '/' || next[1] == '\\') {
+		return "/"
+	}
+	for i := 0; i < len(next); i++ {
+		if next[i] < 0x20 || next[i] == 0x7f {
+			return "/"
+		}
+	}
+	return next
 }
 
 // signSession returns "<expiryUnix>.<hmac>" — no server-side session store needed.

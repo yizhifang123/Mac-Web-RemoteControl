@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -27,6 +28,9 @@ const maxFrameBytes = 8 << 20
 // (the screen helper does; the VP8 test file does not).
 type inputTarget interface {
 	writeInput(line []byte)
+	// writeMove takes a validated mouse move ("m" or "r") from the unreliable move
+	// channel. Moves are coalesced, never queued: see moveSlot.
+	writeMove(m clientInput)
 }
 
 // clientInput is the compact wire message the browser sends over the input data
@@ -41,6 +45,11 @@ type clientInput struct {
 	DY float64 `json:"dy"`
 	C  string  `json:"c"` // key code (browser KeyboardEvent.code)
 	F  int     `json:"f"` // modifier bitmask: shift1|ctrl2|alt4|meta8
+	// Sequenced moves (see moveSeq): N orders "m" and "c" moves sent over the
+	// unordered move channel; CX/CY are "c"'s running totals of relative motion.
+	N  int64   `json:"n"`
+	CX float64 `json:"cx"`
+	CY float64 `json:"cy"`
 }
 
 // translateInput validates one client message and renders it as a single line of the
@@ -50,68 +59,79 @@ type clientInput struct {
 // The modifier bitmask travels with every event so the injector applies absolute
 // modifier state (no stuck Cmd/Shift from dropped keyup events).
 func translateInput(data []byte) ([]byte, bool) {
-	if len(data) > 256 { // a legit message is tens of bytes
+	m, ok := decodeInput(data)
+	if !ok {
 		return nil, false
 	}
+	line := m.line()
+	return line, line != nil // "c" has no line of its own: it goes through moveSeq
+}
+
+// decodeInput parses and validates one client message; everything line() renders
+// has passed through here first.
+func decodeInput(data []byte) (clientInput, bool) {
 	var m clientInput
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, false
+	if len(data) > 256 { // a legit message is tens of bytes
+		return m, false
 	}
-	if m.F < 0 || m.F > 15 {
-		return nil, false
+	if err := json.Unmarshal(data, &m); err != nil {
+		return m, false
+	}
+	if m.F < 0 || m.F > 15 || m.N < 0 {
+		return m, false
 	}
 	switch m.T {
 	case "m":
-		if !inUnit(m.X) || !inUnit(m.Y) {
-			return nil, false
-		}
-		return []byte(fmt.Sprintf("m %.5f %.5f %d\n", m.X, m.Y, m.F)), true
+		return m, inUnit(m.X) && inUnit(m.Y)
+	case "c":
+		return m, m.N > 0 // totals are differenced and the delta clamped in moveSeq
+	case "r", "w", "x":
+		return m, true // deltas are clamped when rendered
+	case "D", "u":
+		return m, m.B >= 0 && m.B <= 2
+	case "d":
+		return m, m.B >= 0 && m.B <= 2 && inUnit(m.X) && inUnit(m.Y)
+	case "k", "K":
+		return m, validKeyCode(m.C)
+	}
+	return m, false
+}
+
+// line renders a validated message as one helper-protocol command.
+func (m clientInput) line() []byte {
+	switch m.T {
+	case "m":
+		return []byte(fmt.Sprintf("m %.5f %.5f %d\n", m.X, m.Y, m.F))
 	case "r":
 		// Relative mouse move (game mode / pointer lock): pixel deltas, not positions.
-		return []byte(fmt.Sprintf("r %.1f %.1f %d\n", clampDelta(m.DX), clampDelta(m.DY), m.F)), true
+		return []byte(fmt.Sprintf("r %.1f %.1f %d\n", clampDelta(m.DX), clampDelta(m.DY), m.F))
 	case "D":
 		// Button down at the current cursor — game mode has no absolute position.
-		if m.B < 0 || m.B > 2 {
-			return nil, false
-		}
-		return []byte(fmt.Sprintf("D %d %d\n", m.B, m.F)), true
+		return []byte(fmt.Sprintf("D %d %d\n", m.B, m.F))
 	case "d":
-		if m.B < 0 || m.B > 2 || !inUnit(m.X) || !inUnit(m.Y) {
-			return nil, false
-		}
 		// Carry the click position so the press lands exactly where the browser
 		// clicked, independent of the last mouse-move.
-		return []byte(fmt.Sprintf("d %d %.5f %.5f %d\n", m.B, m.X, m.Y, m.F)), true
+		return []byte(fmt.Sprintf("d %d %.5f %.5f %d\n", m.B, m.X, m.Y, m.F))
 	case "u":
-		if m.B < 0 || m.B > 2 {
-			return nil, false
-		}
-		return []byte(fmt.Sprintf("u %d %d\n", m.B, m.F)), true
+		return []byte(fmt.Sprintf("u %d %d\n", m.B, m.F))
 	case "w":
-		return []byte(fmt.Sprintf("w %.1f %.1f %d\n", clampScroll(m.DX), clampScroll(m.DY), m.F)), true
+		return []byte(fmt.Sprintf("w %.1f %.1f %d\n", clampScroll(m.DX), clampScroll(m.DY), m.F))
 	case "k", "K":
-		if !validKeyCode(m.C) {
-			return nil, false
-		}
-		return []byte(fmt.Sprintf("%s %s %d\n", m.T, m.C, m.F)), true
+		return []byte(fmt.Sprintf("%s %s %d\n", m.T, m.C, m.F))
 	case "x":
-		return []byte("x\n"), true // release everything (buttons + modifiers)
+		return []byte("x\n") // release everything (buttons + modifiers)
 	}
-	return nil, false
+	return nil
 }
 
 func inUnit(v float64) bool { return v >= 0 && v <= 1 }
 
-// clampDelta bounds one relative-move delta; no legit human motion exceeds this in
-// one 8ms tick, and it keeps a hostile client from teleport-spamming the cursor.
+// maxDelta bounds one injected relative move; no legit human motion exceeds this in
+// one tick, and it keeps a hostile client from teleport-spamming the cursor.
+const maxDelta = 1000
+
 func clampDelta(v float64) float64 {
-	if v > 1000 {
-		return 1000
-	}
-	if v < -1000 {
-		return -1000
-	}
-	return v
+	return math.Max(-maxDelta, math.Min(maxDelta, v))
 }
 
 func clampScroll(v float64) float64 {
@@ -136,6 +156,20 @@ func validKeyCode(c string) bool {
 		}
 	}
 	return true
+}
+
+// helperFailure turns a dead capture helper's exit status into a viewer-legible
+// error. Exit code 3 is the helper's "no capturable display" signal (main.swift):
+// the display was asleep and could not be woken — the one failure the person at the
+// browser can actually act on, so it must not surface as a bare EOF. The helper has
+// already exited by the time its stdout hits EOF, so the Wait here returns promptly;
+// the deferred cmd.Wait() in stream() then reports "already called", which it ignores.
+func helperFailure(cmd *exec.Cmd, readErr error) error {
+	var ee *exec.ExitError
+	if errors.As(cmd.Wait(), &ee) && ee.ExitCode() == 3 {
+		return errors.New("the Mac has no capturable display — its screen is asleep and could not be woken (lid closed?)")
+	}
+	return fmt.Errorf("read frame header: %w", readErr)
 }
 
 // frameSource produces a video track's codec and pumps encoded samples into it until
@@ -228,6 +262,9 @@ type screenSource struct {
 
 	mu    sync.Mutex
 	stdin io.WriteCloser // set once the helper starts; nil before/after
+
+	wmu   sync.Mutex // serializes every write to stdin, so lines never interleave
+	moves moveSlot
 }
 
 func (*screenSource) codec() webrtc.RTPCodecCapability {
@@ -237,13 +274,45 @@ func (*screenSource) codec() webrtc.RTPCodecCapability {
 func (s *screenSource) hasAudio() bool { return s.cfg.audio }
 
 // writeInput forwards one already-validated command line to the helper. Best-effort:
-// input arriving before the helper is up (or after it exits) is dropped.
+// input arriving before the helper is up (or after it exits) is dropped. A pending
+// mouse move is written first, so a click never lands before the move preceding it.
 func (s *screenSource) writeInput(line []byte) {
 	s.mu.Lock()
 	w := s.stdin
 	s.mu.Unlock()
-	if w != nil {
-		_, _ = w.Write(line)
+	if w == nil {
+		return
+	}
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	for mv := s.moves.take(); mv != nil; mv = s.moves.take() {
+		_, _ = w.Write(mv)
+	}
+	_, _ = w.Write(line)
+}
+
+func (s *screenSource) writeMove(m clientInput) { s.moves.put(m) }
+
+// requestKeyframe asks the helper's encoder for an IDR as the next frame. Rides the
+// helper's stdin, which is open even in view-only mode for exactly this.
+func (s *screenSource) requestKeyframe() { s.writeInput([]byte("kf\n")) }
+
+// pumpMoves writes coalesced moves to the helper as they arrive. While a write is
+// blocked (the injector is behind), new moves merge into the pending slot instead of
+// queueing — so a backlog collapses to the latest position rather than replaying
+// every stale one late, which is what "the cursor retraces my path" looks like.
+func (s *screenSource) pumpMoves(ctx context.Context, w io.Writer) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.moves.wakeCh():
+		}
+		s.wmu.Lock()
+		for mv := s.moves.take(); mv != nil; mv = s.moves.take() {
+			_, _ = w.Write(mv)
+		}
+		s.wmu.Unlock()
 	}
 }
 
@@ -263,8 +332,7 @@ func (s *screenSource) stream(ctx context.Context, video, audio *webrtc.TrackLoc
 	if s.cfg.audio {
 		args = append(args, "--audio", "on")
 	}
-	inputOn := s.inputMode == "on" || s.inputMode == "dry"
-	if inputOn {
+	if s.inputMode == "on" || s.inputMode == "dry" {
 		args = append(args, "--input", s.inputMode)
 	}
 
@@ -274,27 +342,27 @@ func (s *screenSource) stream(ctx context.Context, video, audio *webrtc.TrackLoc
 	if err != nil {
 		return err
 	}
-	var stdin io.WriteCloser
-	if inputOn {
-		if stdin, err = cmd.StdinPipe(); err != nil {
-			return err
-		}
+	// stdin is always open: it carries keyframe requests even in view-only mode. The
+	// helper only injects input when started with --input, so this grants nothing.
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
 	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start capture helper %q: %w", s.helperPath, err)
 	}
-	if inputOn {
-		s.mu.Lock()
-		s.stdin = stdin
-		s.mu.Unlock()
-	}
+	s.moves.clear() // a move left over from the previous session must not leak into this one
+	s.mu.Lock()
+	s.stdin = stdin
+	s.mu.Unlock()
+	go s.pumpMoves(ctx, stdin)
 	defer func() {
 		s.mu.Lock()
-		s.stdin = nil
-		s.mu.Unlock()
-		if stdin != nil {
-			_ = stdin.Close()
+		if s.stdin == stdin { // a late teardown must not unhook the NEXT session's helper
+			s.stdin = nil
 		}
+		s.mu.Unlock()
+		_ = stdin.Close()
 		_ = cmd.Wait() // reaped after ctx cancellation kills it
 	}()
 
@@ -307,7 +375,7 @@ func (s *screenSource) stream(ctx context.Context, video, audio *webrtc.TrackLoc
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fmt.Errorf("read frame header: %w", err)
+			return helperFailure(cmd, err)
 		}
 		kind := header[0]
 		n := binary.BigEndian.Uint32(header[1:5])

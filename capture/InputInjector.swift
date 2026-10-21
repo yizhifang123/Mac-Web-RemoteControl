@@ -221,18 +221,26 @@ final class InputInjector {
     ]
 }
 
-// InputReader pumps host commands from stdin into the injector on a background thread.
+// InputReader pumps host commands from stdin on a background thread. "kf" (keyframe
+// request, from the browser's PLI/FIR) is handled in every mode; everything else goes
+// to the injector, which exists only when started with --input — so a view-only
+// helper reads stdin but can never inject.
 // Retain the instance for the process lifetime (see the ARC note in main.swift).
 final class InputReader {
-    private let injector: InputInjector
-    init(injector: InputInjector) { self.injector = injector }
+    private let injector: InputInjector?
+    private let onKeyframe: () -> Void
+    init(injector: InputInjector?, onKeyframe: @escaping () -> Void) {
+        self.injector = injector
+        self.onKeyframe = onKeyframe
+    }
 
     func start() {
-        DispatchQueue.global(qos: .userInteractive).async { [injector] in
+        DispatchQueue.global(qos: .userInteractive).async { [injector, onKeyframe] in
             logErr("input: reader started (reading commands on stdin)")
             while let line = readLine(strippingNewline: true) {
                 if line.isEmpty { continue }
-                injector.handle(line)
+                if line == "kf" { onKeyframe(); continue }
+                injector?.handle(line)
             }
             logErr("input: stdin closed; reader stopping")
         }
