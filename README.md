@@ -107,6 +107,10 @@ Privacy & Security, then restart the server. macOS only re-reads permissions at 
 | `-addr 0.0.0.0:9000` | Bind for LAN testing (read the security docs first) |
 | `-set-password` | Read a new password from stdin and exit (then restart the server) |
 | `-new-password` | Generate a random password, print it, and exit (then restart) |
+| `-set-turn-key` | Read a Cloudflare TURN key ID + API token from stdin, store them, and exit (then restart) |
+
+Append `?relay` to the page URL to force media through TURN (tests the relay path);
+`?stats` (or press **I**) shows a live latency/loss overlay.
 
 ## Hosting it on your own domain
 
@@ -143,9 +147,9 @@ tunnel in front, and never disable the password gate on a network-reachable bind
 - **A single password is the whole perimeter.** There is no per-user auth, no 2FA, and
   no audit log. For anything beyond personal use, put a real identity provider
   (Cloudflare Access, an OAuth proxy) in front.
-- **Direct UDP is not guaranteed.** On restrictive networks that block UDP, media has
-  no fallback path yet — TURN support is not implemented. If your network forces a
-  relay, this will not connect.
+- **TURN needs a Cloudflare key.** On networks that block direct UDP, media falls back
+  to Cloudflare's TURN relay (including TURN-over-TLS on 443) — but only once you store
+  a key with `-set-turn-key`. Without one it is STUN-only and will not connect there.
 - **Not signed or notarized.** You build it yourself and grant permissions to a
   locally-built binary.
 
