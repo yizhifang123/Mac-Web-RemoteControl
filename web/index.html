@@ -14,21 +14,31 @@
          background: rgba(0,0,0,.6); border-radius: 6px;
          font-variant-numeric: tabular-nums; }
   #hud b { color: #8ad; }
-  #ctl { position: fixed; bottom: 8px; left: 8px; }
+  #ctl { position: fixed; bottom: 8px; left: 8px;
+         display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
   #ctl button { background: rgba(0,0,0,.6); color: #e8e8ea; border: 1px solid #444;
                 border-radius: 6px; padding: 4px 8px; font: inherit; cursor: pointer; }
   /* Clean view: the HUD is a connection-debugging aid — gone once the stream
      is up (and while controlling), back if the connection degrades. */
   body.connected #hud, body.engaged #hud { display: none; }
+  /* Latency overlay: I toggles it (while not controlling), ?stats opens with it on.
+     Stays up while controlling — the point is to read it mid-game. */
+  #stats { position: fixed; top: 8px; right: 8px; padding: 6px 10px; margin: 0;
+           background: rgba(0,0,0,.7); border-radius: 6px; pointer-events: none;
+           font: 12px/1.45 ui-monospace, Menlo, monospace; white-space: pre; }
 </style>
 </head>
 <body>
   <div id="stage"><video id="v" autoplay playsinline muted></video></div>
   <div id="hud">ws:<b id="ws">…</b> · pc:<b id="pc">…</b> · ice:<b id="ice">…</b> · <span id="stat">…</span></div>
-  <!-- The only on-screen control. Everything else (modes, sensitivity, input
+  <pre id="stats" hidden></pre>
+  <!-- The only on-screen controls. Everything else (modes, sensitivity, input
        status) was deliberately stripped: click video to control, G toggles
        Desktop/Game mode while not controlling, Esc releases. -->
-  <div id="ctl"><button id="mute" title="toggle audio">🔇</button></div>
+  <div id="ctl">
+    <button id="lock" title="take control: fullscreen + lock cursor (hold Esc to release)">⌖</button>
+    <button id="mute" title="toggle audio">🔇</button>
+  </div>
 <script>
 const $ = id => document.getElementById(id);
 const v = $('v');
@@ -37,17 +47,67 @@ $('mute').addEventListener('click', () => {
   v.muted = !v.muted;
   $('mute').textContent = v.muted ? '🔇' : '🔊';
 });
+// ICE servers: refetched from /ice-servers on EVERY setup(), not once per page load —
+// a tab left open past the credentials' TTL would otherwise reconnect with expired
+// TURN credentials. The endpoint is same-origin and post-auth (the session cookie
+// rides along) and the server caches minted credentials, so the refetch is cheap. On
+// fetch failure the last-known list (initially STUN-only) keeps everything working
+// exactly as before TURN existed.
+let iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+async function fetchIceServers() {
+  try {
+    const j = await (await fetch('/ice-servers')).json();
+    if (j && j.iceServers && j.iceServers.length) iceServers = j.iceServers;
+  } catch {}
+}
+// ?relay forces every candidate through TURN — the "does the relay path work at all"
+// test, because a friendly network happily connects direct and hides a broken relay.
+const forceRelay = new URLSearchParams(location.search).has('relay');
+let relayImpossible = false; // ?relay set, but /ice-servers offered no TURN server
 const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-const ws = new WebSocket(`${proto}://${location.host}/ws?role=client`);
+let ws = null;
 let pc;
 
-function setup() {
-  pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+// Is the stream actually up? Everything below turns on this question, because the
+// signaling socket and the media path fail independently and only one of them is
+// the thing the user is looking at.
+const mediaHealthy = () => !!pc && pc.connectionState === 'connected';
+
+// pc.close() does not fire onconnectionstatechange, so the HUD has to be un-hidden
+// by hand — otherwise a dead session goes on looking healthy.
+const closePC = () => {
+  if (pc) { pc.close(); pc = null; }
+  document.body.classList.remove('connected');
+};
+
+async function setup() {
+  await fetchIceServers();
+  // ?relay with no TURN server can never connect — every candidate is filtered.
+  // Without this the HUD sits at 'checking' forever with zero explanation.
+  relayImpossible = forceRelay && !iceServers.some(
+    s => [].concat(s.urls || []).some(u => u.startsWith('turn:') || u.startsWith('turns:')));
+  if (relayImpossible) {
+    console.error('?relay: /ice-servers returned no TURN servers; a relay-only connection cannot establish');
+    $('ice').textContent = 'relay forced but no TURN servers — set TURN key + restart server';
+  }
+  pc = new RTCPeerConnection(forceRelay ? { iceServers, iceTransportPolicy: 'relay' } : { iceServers });
   pc.onicecandidate = e => {
-    if (e.candidate) ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
+    // The socket may be mid-reconnect. A dropped trickle candidate is survivable;
+    // an exception thrown inside this callback is not.
+    if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'candidate', candidate: e.candidate }));
+    }
   };
-  pc.ontrack = e => { v.srcObject = e.streams[0]; $('stat').textContent = 'track received'; };
-  pc.oniceconnectionstatechange = () => $('ice').textContent = pc.iceConnectionState;
+  pc.ontrack = e => {
+    v.srcObject = e.streams[0]; $('stat').textContent = 'track received';
+    // Ask for the smallest jitter buffer. Only a hint — Chrome keeps a network-driven
+    // floor — but the default is tuned for watching video, not for playing.
+    try { e.receiver.jitterBufferTarget = 0; } catch {}
+  };
+  pc.oniceconnectionstatechange = () =>
+    $('ice').textContent = pc.iceConnectionState
+      + (forceRelay ? ' (relay forced)' : '')
+      + (relayImpossible ? ' — no TURN servers! set TURN key + restart server' : '');
   pc.onconnectionstatechange = () => {
     $('pc').textContent = pc.connectionState;
     // HUD is a connection-debugging aid: gone while the stream is healthy,
@@ -56,7 +116,12 @@ function setup() {
   };
   // The host creates the "input" data channel only when control is enabled; a
   // view-only session never sees one.
-  pc.ondatachannel = e => { if (e.channel.label === 'input') setupInput(e.channel); };
+  pc.ondatachannel = e => {
+    if (e.channel.label === 'input') setupInput(e.channel);
+    // Mouse moves only: unordered, never retransmitted (see the host). Older hosts
+    // don't offer it, and sendMove then falls back to the reliable channel.
+    if (e.channel.label === 'move') { moveCh = e.channel; mseq = 0; cumX = cumY = sentX = sentY = 0; }
+  };
 }
 
 // ---- Input control (Phase 3/4): explicit engage/release, two modes ----
@@ -64,10 +129,26 @@ function setup() {
 // Game (Phase 4): click video → fullscreen + keyboard lock + pointer lock, relative
 // deltas. Esc is FORWARDED to the Mac (Roblox menu); press-and-HOLD Esc uses the
 // browser's built-in gesture to exit pointer lock, which releases control here.
-let input = null, engaged = false, mode = 'desk';
+let input = null, engaged = false, mode = 'desk', listenersBound = false;
+let moveCh = null, movesSent = 0;
+// Sequenced moves (the host's moveSeq): every move carries n, and game-mode motion
+// travels as running totals since the channel opened, so a lost or reordered packet
+// on the unreliable move channel can neither lose motion nor drag the cursor back.
+// Both restart with each new move channel — the host's state is per session too.
+let mseq = 0, cumX = 0, cumY = 0, sentX = 0, sentY = 0;
 
 function setupInput(channel) {
+  // Only the CHANNEL is per-session. The listeners below are bound to v/document/
+  // window, which outlive every peer connection, so they must be bound exactly once
+  // per page load. Every offer runs closePC() + setup() (see onSignal), and closePC()
+  // cannot unbind DOM listeners — so rebinding here would leave the old set attached
+  // and one physical mousemove would fire N handlers after N reconnects, each with
+  // its own `lastMove` passing its own gate. That multiplies the input rate by the
+  // reconnect count, floods the injector, and shows up as the cursor retracing your
+  // path seconds late — worsening until a page refresh, and unaffected by bitrate.
   input = channel;
+  if (listenersBound) return;
+  listenersBound = true;
 
   const send = o => { if (input && input.readyState === 'open' && engaged) input.send(JSON.stringify(o)); };
   // Absolute modifier state carried on every event, so a dropped keyup can't leave a
@@ -118,6 +199,14 @@ function setupInput(channel) {
   };
 
   v.addEventListener('click', () => { if (!engaged) (mode === 'game' ? engageGame() : engage()); });
+  // Lock button: one click into Game-style control — fullscreen, keyboard lock, cursor
+  // locked to the stream — without needing G first. Pointer lock means relative mouse,
+  // which only Game mode speaks, so it switches mode. Hold Esc to release, as in Game.
+  $('lock').addEventListener('click', e => {
+    e.currentTarget.blur(); // Space/Enter later must not re-press it
+    setMode('game');
+    engageGame();
+  });
   v.addEventListener('contextmenu', e => e.preventDefault());
 
   document.addEventListener('pointerlockchange', () => {
@@ -128,26 +217,82 @@ function setupInput(channel) {
     if (!document.fullscreenElement && engaged && mode === 'game') release();
   });
 
-  // Game deltas accumulate between sends so the ~120 Hz cap drops packets, not motion.
-  let lastMove = 0, accX = 0, accY = 0;
+  // Moves go out on the unreliable "move" channel. If its send buffer is backing up
+  // (the link is congested), hold off instead of piling more on — the next send
+  // carries the latest state anyway. Without a move channel they take the reliable
+  // one, which the host also accepts sequenced moves on.
+  const sendMove = o => {
+    if (!engaged) return true;
+    if (moveCh && moveCh.readyState === 'open') {
+      if (moveCh.bufferedAmount > 8192) return false;
+      moveCh.send(JSON.stringify(o)); movesSent++; return true;
+    }
+    send(o); movesSent++; return true;
+  };
+
+  // Game mode: totals go out at most every 4 ms, with the remainder ALWAYS flushed on
+  // a timer. When motion stops (and before any click) the final totals are re-sent on
+  // the reliable channel, so even a lost LAST packet cannot leave the camera short.
+  let accF = 0, lastSend = 0, flushTimer = 0, settleTimer = 0;
+  const relMsg = () => ({ t: 'c', n: ++mseq, cx: cumX, cy: cumY, f: accF });
+  const flushRel = () => {
+    flushTimer = 0;
+    if (cumX === sentX && cumY === sentY) return;
+    if (!sendMove(relMsg())) { flushTimer = setTimeout(flushRel, 4); return; }
+    sentX = cumX; sentY = cumY; lastSend = performance.now();
+  };
+  const settleRel = () => { settleTimer = 0; if (engaged && mseq) send(relMsg()); };
+  const addDelta = (dx, dy, e) => {
+    cumX += dx; cumY += dy; accF = mods(e);
+    const wait = 4 - (performance.now() - lastSend);
+    if (wait <= 0) { clearTimeout(flushTimer); flushRel(); }
+    else if (!flushTimer) flushTimer = setTimeout(flushRel, wait);
+    clearTimeout(settleTimer); settleTimer = setTimeout(settleRel, 60);
+  };
+  // pointerrawupdate fires for every hardware sample instead of once per display
+  // frame like mousemove — up to a frame sooner. Once it has delivered real motion,
+  // mousemove deltas are ignored so nothing is counted twice; if it never fires
+  // (unsupported, or no movement under pointer lock), mousemove carries on alone.
+  let rawSeen = false;
+  if ('onpointerrawupdate' in window) {
+    v.addEventListener('pointerrawupdate', e => {
+      if (!engaged || mode !== 'game' || !(e.movementX || e.movementY)) return;
+      rawSeen = true;
+      addDelta(e.movementX, e.movementY, e);
+    });
+  }
+
+  // Desktop mode: the latest absolute position wins; ~120 Hz, with a trailing flush
+  // so the cursor lands where the mouse stopped, and the same reliable settle.
+  let lastAbs = null, lastAbsSent = null, absTimer = 0, absSettle = 0, lastAbsSend = 0;
+  const flushAbs = () => {
+    absTimer = 0;
+    if (!lastAbs) return;
+    if (!sendMove({ ...lastAbs, n: ++mseq })) { absTimer = setTimeout(flushAbs, 8); return; }
+    lastAbsSent = lastAbs; lastAbs = null; lastAbsSend = performance.now();
+  };
+  const settleAbs = () => { absSettle = 0; if (engaged && lastAbsSent) send({ ...lastAbsSent, n: ++mseq }); };
   v.addEventListener('mousemove', e => {
     if (!engaged) return;
-    const now = performance.now();
-    if (mode === 'game') {
-      accX += e.movementX; accY += e.movementY;
-      if (now - lastMove < 8) return;
-      lastMove = now;
-      if (accX || accY) { send({ t: 'r', dx: accX, dy: accY, f: mods(e) }); accX = accY = 0; }
-      return;
-    }
-    if (now - lastMove < 8) return; // ~120 Hz cap
-    lastMove = now;
-    const p = norm(e); send({ t: 'm', x: p.x, y: p.y, f: mods(e) });
+    if (mode === 'game') { if (!rawSeen) addDelta(e.movementX, e.movementY, e); return; }
+    const p = norm(e); lastAbs = { t: 'm', x: p.x, y: p.y, f: mods(e) };
+    const wait = 8 - (performance.now() - lastAbsSend);
+    if (wait <= 0) { clearTimeout(absTimer); flushAbs(); }
+    else if (!absTimer) absTimer = setTimeout(flushAbs, wait);
+    clearTimeout(absSettle); absSettle = setTimeout(settleAbs, 60);
   });
   v.addEventListener('mousedown', e => {
     if (!engaged) return;
     e.preventDefault();
-    if (mode === 'game') { send({ t: 'D', b: e.button, f: mods(e) }); return; }
+    // Game: re-send the current totals on the reliable channel right before the press,
+    // so the click can never land ahead of the motion that preceded it (the unreliable
+    // copy may be lost or still in flight). Desktop clicks carry their own position.
+    if (mode === 'game') {
+      clearTimeout(flushTimer); flushRel();
+      if (mseq) send(relMsg());
+      send({ t: 'D', b: e.button, f: mods(e) }); return;
+    }
+    clearTimeout(absTimer); flushAbs();
     const p = norm(e); send({ t: 'd', b: e.button, x: p.x, y: p.y, f: mods(e) });
   });
   window.addEventListener('mouseup', e => { if (engaged) send({ t: 'u', b: e.button, f: mods(e) }); });
@@ -167,26 +312,153 @@ function setupInput(channel) {
   window.addEventListener('blur', release);
 }
 
-ws.onopen  = () => $('ws').textContent = 'open';
-ws.onclose = () => $('ws').textContent = 'closed';
-ws.onerror = () => $('ws').textContent = 'error';
+// Each onSignal invocation runs independently, so while the offer handler is
+// awaiting setup() (an /ice-servers fetch), trickled candidates arrive with pc unset
+// or the remote description not yet applied. Dropping them can kill the session — on
+// a blocked network the host's relay candidate may be the only workable one — so
+// they queue until the offer is in place. epoch guards the mirror-image race: a
+// peer-disconnected landing mid-setup must not leave a pc serving a dead session.
+let pendingCandidates = [];
+let epoch = 0;
 
-ws.onmessage = async ev => {
+const addCandidate = async c => {
+  try { await pc.addIceCandidate(c); } catch (e) { console.warn('addIceCandidate', e); }
+};
+
+async function onSignal(ev) {
   const msg = JSON.parse(ev.data);
   if (msg.type === 'offer') {
-    if (!pc) setup();
+    // An offer always comes from a brand-new host peer connection (new ICE
+    // credentials, new DTLS fingerprint), so the old one is replaced outright —
+    // feeding a fresh offer to a live pc is not a renegotiation.
+    closePC();
+    pendingCandidates = [];
+    const e = epoch;
+    await setup();
+    if (e !== epoch) { // host vanished while we were setting up
+      closePC();
+      return;
+    }
     await pc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
     await pc.setLocalDescription(await pc.createAnswer());
     ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription.sdp }));
     $('stat').textContent = 'answered offer';
+    const queued = pendingCandidates;
+    pendingCandidates = [];
+    for (const c of queued) await addCandidate(c);
   } else if (msg.type === 'candidate') {
-    try { await pc.addIceCandidate(msg.candidate); } catch (e) { console.warn('addIceCandidate', e); }
+    if (!pc || !pc.remoteDescription) { pendingCandidates.push(msg.candidate); return; }
+    await addCandidate(msg.candidate);
+  } else if (msg.type === 'error') {
+    // The host killed the session on purpose and says why (e.g. the Mac's display
+    // is asleep and would not wake). Drop our side too — its pc is already dead —
+    // and let the requestOffer loop keep retrying; the reason stays in the HUD
+    // between attempts instead of a silent black screen.
+    epoch++;
+    pendingCandidates = [];
+    closePC();
+    $('stat').textContent = 'host: ' + (msg.message || 'unknown error');
   } else if (msg.type === 'peer-disconnected') {
+    // The HOST's signaling socket dropped. Its media session survives that now, so
+    // if video is still arriving, keep it and wait for signaling to come back.
+    if (mediaHealthy()) {
+      $('stat').textContent = 'host signaling dropped — stream still up';
+      return;
+    }
+    epoch++;
+    pendingCandidates = []; // stale candidates must not leak into the next session
     $('stat').textContent = 'host disconnected';
-    document.body.classList.remove('connected'); // close() won't fire the state event
-    if (pc) { pc.close(); pc = null; }
+    closePC();
   }
-};
+}
+
+// ---- Signaling transport: reconnect, and never mistake it for the stream ----
+// This socket carries nothing at all once ICE completes, so anything on the path —
+// a school firewall's idle reap, the Cloudflare edge, a cloudflared reconnect — is
+// free to close it. That used to end the whole session and force a page refresh.
+// Now it reconnects, and a peer connection still delivering video is left alone.
+let wsRetry = 0, lastOfferRequest = 0;
+
+// Ask the host for a stream. Throttled, because this doubles as the retry path for
+// a host that isn't up yet or a negotiation that stalled halfway.
+function requestOffer() {
+  if (!ws || ws.readyState !== WebSocket.OPEN || mediaHealthy()) return;
+  const now = Date.now();
+  if (now - lastOfferRequest < 9000) return;
+  lastOfferRequest = now;
+  ws.send(JSON.stringify({ type: 'ready' }));
+  $('stat').textContent = 'requesting stream…';
+}
+
+function connectWS() {
+  ws = new WebSocket(`${proto}://${location.host}/ws?role=client`);
+  ws.onopen = () => {
+    wsRetry = 0;
+    lastOfferRequest = 0; // a fresh socket may be talking to a restarted host
+    $('ws').textContent = 'open';
+    requestOffer();
+  };
+  ws.onclose = () => {
+    $('ws').textContent = 'closed';
+    setTimeout(connectWS, Math.min(1000 * 2 ** wsRetry++, 10000));
+  };
+  ws.onerror = () => $('ws').textContent = 'error';
+  ws.onmessage = onSignal;
+}
+connectWS();
+setInterval(requestOffer, 3000);
+
+// ---- Latency overlay (I to toggle, ?stats to start with it on) ----
+// Everything here is a per-second delta, not a running total, so it shows what the
+// link is doing NOW. "arrive→show" comes from requestVideoFrameCallback: how long a
+// frame sat in the browser between its last packet arriving and it being shown —
+// the buffering that the playout-delay extension is meant to remove.
+let statsOn = new URLSearchParams(location.search).has('stats');
+$('stats').hidden = !statsOn;
+window.addEventListener('keydown', e => {
+  if (!engaged && e.code === 'KeyI') { statsOn = !statsOn; $('stats').hidden = !statsOn; }
+});
+let showSum = 0, showN = 0;
+if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+  const onFrame = (_, m) => {
+    if (m.receiveTime && m.expectedDisplayTime) { showSum += m.expectedDisplayTime - m.receiveTime; showN++; }
+    v.requestVideoFrameCallback(onFrame);
+  };
+  v.requestVideoFrameCallback(onFrame);
+}
+let prevIn = null, prevMoves = 0;
+setInterval(async () => {
+  if (!statsOn) return;
+  if (!pc) { $('stats').textContent = 'no stream'; return; }
+  let r;
+  try { r = await pc.getStats(); } catch { $('stats').textContent = 'no stream'; return; }
+  let vin = null, pair = null;
+  const byId = {};
+  r.forEach(s => {
+    byId[s.id] = s;
+    if (s.type === 'inbound-rtp' && s.kind === 'video') vin = s;
+    if (s.type === 'transport' && s.selectedCandidatePairId) pair = s.selectedCandidatePairId;
+  });
+  const cp = pair && byId[pair], lc = cp && byId[cp.localCandidateId];
+  const path = lc ? `${lc.candidateType}/${lc.protocol}${lc.relayProtocol ? ' via ' + lc.relayProtocol : ''}` : '?';
+  const ms = x => (x == null || !isFinite(x)) ? '–' : Math.round(x) + ' ms';
+  const lines = [`path      ${path}`, `rtt       ${ms(cp && cp.currentRoundTripTime * 1000)}`];
+  if (vin && prevIn) {
+    const d = k => (vin[k] ?? 0) - (prevIn[k] ?? 0);
+    const dt = (vin.timestamp - prevIn.timestamp) / 1000;
+    lines.push(
+      `fps       ${vin.framesPerSecond ?? '–'}  ${vin.frameWidth || '?'}x${vin.frameHeight || '?'}`,
+      `bitrate   ${Math.round(d('bytesReceived') * 8 / dt / 1000)} kbps`,
+      `buffer    ${ms(d('jitterBufferDelay') / d('jitterBufferEmittedCount') * 1000)}`,
+      `decode    ${ms(d('totalDecodeTime') / d('framesDecoded') * 1000)}`,
+      `arrive→show ${ms(showN ? showSum / showN : null)}`,
+      `dropped   ${d('framesDropped')}  lost ${d('packetsLost')}  freezes ${vin.freezeCount ?? 0}`);
+  }
+  const mc = moveCh ? moveCh.readyState : 'none (reliable fallback)';
+  lines.push(`moves/s   ${movesSent - prevMoves}  (move ch: ${mc})`);
+  prevIn = vin; prevMoves = movesSent; showSum = 0; showN = 0;
+  $('stats').textContent = lines.join('\n');
+}, 1000);
 
 // HUD: show decoded frames / bytes so the pipe is observable (and QA-checkable).
 setInterval(async () => {

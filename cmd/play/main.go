@@ -28,6 +28,7 @@ import (
 	play "github.com/yizhifang123/Mac-Web-RemoteControl"
 	"github.com/yizhifang123/Mac-Web-RemoteControl/internal/auth"
 	"github.com/yizhifang123/Mac-Web-RemoteControl/internal/host"
+	"github.com/yizhifang123/Mac-Web-RemoteControl/internal/ice"
 	"github.com/yizhifang123/Mac-Web-RemoteControl/internal/signaling"
 )
 
@@ -37,6 +38,7 @@ func main() {
 	configPath := flag.String("config", auth.DefaultConfigPath(), "path to the secrets file (mode 0600)")
 	newPassword := flag.Bool("new-password", false, "generate a random password, print it, and exit")
 	setPassword := flag.Bool("set-password", false, "read a password from stdin, store it, and exit")
+	setTurnKey := flag.Bool("set-turn-key", false, "read a Cloudflare TURN key ID + API token from stdin, store them, and exit")
 	noAuth := flag.Bool("no-auth", false, "DANGEROUS: serve with no password (loopback binds only)")
 	hostConfig := host.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -45,12 +47,34 @@ func main() {
 		runSetPassword(*configPath)
 		return
 	}
+	if *setTurnKey {
+		runSetTurnKey(*configPath)
+		return
+	}
 
 	if *webDir != "" {
 		log.Printf("serving client from %s (not the embedded copy)", *webDir)
 	}
 
 	gate, token := setupAuth(*configPath, *newPassword, *noAuth, *addr)
+
+	// ICE servers: with a stored Cloudflare TURN key the provider mints short-lived
+	// relay credentials (needed on networks that block direct UDP); without one — or
+	// in the -no-auth dev path, which has no config to hold a key — the zero-value
+	// provider serves the STUN-only fallback.
+	prov := &ice.Provider{}
+	if gate != nil {
+		keyID, apiToken := gate.TurnKey()
+		prov.TurnConfig = ice.TurnConfig{KeyID: keyID, APIToken: apiToken}
+		if prov.Enabled() {
+			log.Printf("TURN enabled (Cloudflare key %s)", keyID)
+			// Prewarm the credential cache off the startup path (detached context:
+			// this outlives no request). The first session then finds cached
+			// credentials instead of paying the mint round-trip; on failure the
+			// provider logs it and later calls fall back per its normal rules.
+			go prov.Servers(context.Background())
+		}
+	}
 
 	// Bind before starting the host so the server is already accepting when it dials.
 	ln, err := net.Listen("tcp", *addr)
@@ -65,7 +89,7 @@ func main() {
 	signaling.LogBindHints(*addr)
 
 	go func() {
-		if err := signaling.Serve(ctx, ln, play.WebRoot(*webDir), gate); err != nil && ctx.Err() == nil {
+		if err := signaling.Serve(ctx, ln, play.WebRoot(*webDir), gate, prov.Servers); err != nil && ctx.Err() == nil {
 			log.Fatalf("signaling: %v", err)
 		}
 	}()
@@ -79,6 +103,7 @@ func main() {
 	cfg := hostConfig()
 	cfg.SignalURL = "ws://127.0.0.1:" + port + "/ws"
 	cfg.Token = token
+	cfg.ICEServers = prov.Servers // same provider as the browser: both sides get the relay
 
 	if err := host.Run(ctx, cfg); err != nil {
 		log.Fatalf("host: %v", err)
@@ -108,6 +133,39 @@ func runSetPassword(configPath string) {
 	fmt.Fprintln(os.Stderr, "RESTART the server for this to take effect. A running process holds")
 	fmt.Fprintln(os.Stderr, "the old password and old sessions in memory until it is restarted —")
 	fmt.Fprintln(os.Stderr, "if you are rotating because a session may be stolen, restart NOW.")
+	if warning != "" {
+		fmt.Fprintf(os.Stderr, "note: %s\n", warning)
+	}
+}
+
+// runSetTurnKey stores the Cloudflare TURN key (dashboard: Realtime → TURN keys)
+// read from STDIN. Stdin rather than flags for the same reason as runSetPassword: an
+// API token passed as an argument is visible to every process on the machine while
+// the command runs.
+func runSetTurnKey(configPath string) {
+	in := bufio.NewReader(os.Stdin)
+	read := func(prompt string) string {
+		fmt.Fprint(os.Stderr, prompt)
+		line, err := in.ReadString('\n')
+		// EOF is expected — input piped without a trailing newline. Any OTHER error
+		// means the input was cut short, and whatever arrived first must NOT be
+		// stored: it would silently become a truncated credential that fails only
+		// later, when Cloudflare rejects the first mint.
+		if err != nil && !errors.Is(err, io.EOF) {
+			log.Fatalf("read TURN key: %v", err)
+		}
+		return strings.TrimRight(line, "\r\n")
+	}
+	keyID := read("Cloudflare TURN key ID: ")
+	apiToken := read("TURN key API token: ")
+
+	warning, err := auth.SetTurnKey(configPath, keyID, apiToken)
+	if err != nil {
+		log.Fatalf("set TURN key: %v", err)
+	}
+	fmt.Fprintf(os.Stderr, "\nTURN key stored in %s\n", configPath)
+	fmt.Fprintln(os.Stderr, "RESTART the server for this to take effect. A running process read the")
+	fmt.Fprintln(os.Stderr, "config once at startup and keeps serving STUN-only until it is restarted.")
 	if warning != "" {
 		fmt.Fprintf(os.Stderr, "note: %s\n", warning)
 	}

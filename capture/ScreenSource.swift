@@ -27,7 +27,22 @@ final class ScreenSource: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func start() async throws {
-        let content = try await SCShareableContent.current
+        var content = try await SCShareableContent.current
+        if content.displays.isEmpty {
+            // A sleeping display is invisible to ScreenCaptureKit. Wake it (see
+            // DisplaySleep.swift) and give the panel a few seconds to power on —
+            // the wake is not instant and SCShareableContent lags it slightly.
+            logErr("screen: no capturable displays — display likely asleep; waking and retrying")
+            wakeDisplay(reason: "play: remote session needs the display")
+            for _ in 0..<10 {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                content = try await SCShareableContent.current
+                if !content.displays.isEmpty {
+                    logErr("screen: display is back after wake")
+                    break
+                }
+            }
+        }
         guard let display = content.displays.first else { throw CaptureError.noDisplay }
 
         let filter = SCContentFilter(display: display, excludingWindows: [])

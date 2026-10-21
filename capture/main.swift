@@ -157,6 +157,7 @@ var testSource: TestSource?
 var screenSource: ScreenSource?
 var inputReader: InputReader?
 var audioEncoder: OpusAudioEncoder?
+var displayAwake: DisplaySleepAssertion?
 
 // Audio is optional and non-fatal: a broken opus setup degrades to video-only.
 if cfg.audio {
@@ -171,12 +172,16 @@ if cfg.audio {
 
 // Input injection is off unless explicitly enabled (view-only is the safe default).
 // "dry" opens the reader but posts nothing — used to verify decoding safely.
+// The stdin reader always runs: it also carries keyframe requests, which view-only
+// sessions need too. Without --input it has no injector and ignores input commands.
+var injector: InputInjector?
 if cfg.input == "on" || cfg.input == "dry" {
-    inputReader = InputReader(injector: InputInjector(dryRun: cfg.input == "dry"))
-    inputReader?.start()
+    injector = InputInjector(dryRun: cfg.input == "dry")
 } else {
     logErr("input: disabled (view-only)")
 }
+inputReader = InputReader(injector: injector) { [encoder] in encoder.requestKeyframe() }
+inputReader?.start()
 
 switch cfg.source {
 case "test":
@@ -185,10 +190,19 @@ case "test":
     testSource = source
     source.start()
 case "screen":
+    // Only the real screen source needs this: capturing a display the system is about
+    // to blank is what freezes a passive viewer. See DisplaySleep.swift.
+    displayAwake = DisplaySleepAssertion(reason: "play: streaming this display to a remote session")
     let source = ScreenSource(cfg: encoderConfig, encoder: encoder, audio: audioEncoder)
     screenSource = source
     Task {
         do { try await source.start() }
+        catch CaptureError.noDisplay {
+            // Exit code 3 is the contract with the Go host (source.go helperFailure):
+            // it tells the viewer WHY there is no video instead of a black screen.
+            logErr("screen capture failed: no capturable display even after waking (lid closed? no screen?)")
+            exit(3)
+        }
         catch { logErr("screen capture failed to start: \(error)"); exit(1) }
     }
 default:

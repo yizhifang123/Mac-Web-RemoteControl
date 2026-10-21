@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -367,6 +368,219 @@ func TestSetPasswordWarnsOnShortPasswords(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSetTurnKeyRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	before, _, err := Load(path, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	hashBefore := storedFile(t, path).PasswordHash
+
+	if _, err := SetTurnKey(path, "key123", "tok456"); err != nil {
+		t.Fatalf("SetTurnKey: %v", err)
+	}
+	after, _, err := Load(path, false)
+	if err != nil {
+		t.Fatalf("reload after SetTurnKey: %v", err)
+	}
+	if id, tok := after.TurnKey(); id != "key123" || tok != "tok456" {
+		t.Errorf("TurnKey() = (%q, %q), want the stored key; the server would silently "+
+			"run STUN-only and school-network sessions would stall", id, tok)
+	}
+	if storedFile(t, path).PasswordHash != hashBefore {
+		t.Error("SetTurnKey changed the password hash; configuring TURN must not lock the owner out")
+	}
+	if after.Token() != before.Token() {
+		t.Error("SetTurnKey changed the host bearer token; configuring TURN must not break the running host")
+	}
+
+	// -new-password rewrites the core secrets; the TURN key is unrelated and must
+	// survive, or a routine password rotation silently disables the relay.
+	if _, _, err := Load(path, true); err != nil {
+		t.Fatalf("regenerate: %v", err)
+	}
+	regen, _, err := Load(path, false)
+	if err != nil {
+		t.Fatalf("reload after regenerate: %v", err)
+	}
+	if id, tok := regen.TurnKey(); id != "key123" || tok != "tok456" {
+		t.Errorf("-new-password dropped the TURN key (got %q, %q)", id, tok)
+	}
+
+	for _, tc := range []struct{ name, id, tok string }{
+		{"empty id", "", "tok"},
+		{"empty token", "key", ""},
+		{"blank id", "   ", "tok"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := SetTurnKey(path, tc.id, tc.tok); err == nil {
+				t.Error("a blank TURN credential was accepted; it would fail only later, at the first mint")
+			}
+		})
+	}
+}
+
+// A config written before TURN existed has no turn fields; it must keep loading, and
+// TurnKey() must report "not configured" rather than erroring.
+func TestConfigWithoutTurnFieldsStillLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if _, _, err := Load(path, false); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if raw, _ := os.ReadFile(path); strings.Contains(string(raw), "turn") {
+		t.Fatalf("a fresh config already contains turn fields (omitempty is not working): %s", raw)
+	}
+	a, _, err := Load(path, false)
+	if err != nil {
+		t.Fatalf("a pre-TURN config no longer loads: %v", err)
+	}
+	if id, tok := a.TurnKey(); id != "" || tok != "" {
+		t.Errorf("TurnKey() = (%q, %q) for a config that never stored one", id, tok)
+	}
+}
+
+// -set-turn-key may run before the server has ever started. The resulting file holds
+// ONLY the turn fields; the first Load must generate the core secrets around them
+// instead of refusing with "missing fields" (which would force deleting the file and
+// losing the key that was just stored).
+func TestSetTurnKeyBeforeFirstLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	warning, err := SetTurnKey(path, "key123", "tok456")
+	if err != nil {
+		t.Fatalf("SetTurnKey on a fresh path: %v", err)
+	}
+	if warning == "" {
+		t.Error("no warning that this config has no password yet")
+	}
+	a, password, err := Load(path, false)
+	if err != nil {
+		t.Fatalf("first Load after SetTurnKey: %v", err)
+	}
+	if password == "" {
+		t.Error("first Load did not generate a password around the stored TURN key")
+	}
+	if id, tok := a.TurnKey(); id != "key123" || tok != "tok456" {
+		t.Errorf("TurnKey() = (%q, %q); generating the core secrets dropped the key", id, tok)
+	}
+}
+
+// -new-password is the documented recovery path for a broken config file ("lost it?
+// rerun with -new-password"); it must succeed where a normal load correctly refuses.
+func TestNewPasswordRecoversCorruptConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"password_hash": "trunc`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(path, false); err == nil {
+		t.Error("a corrupt config loaded normally; damage should be loud, not papered over")
+	}
+	a, password, err := Load(path, true)
+	if err != nil {
+		t.Fatalf("-new-password could not recover a corrupt config: %v; its own printed "+
+			"hint would be a lie", err)
+	}
+	if password == "" || a.Token() == "" {
+		t.Error("recovery did not generate fresh credentials")
+	}
+	if _, _, err := Load(path, false); err != nil {
+		t.Errorf("the config written by the recovery does not load: %v", err)
+	}
+}
+
+// The login round-trip must preserve where the browser was headed, query string
+// included: losing ?relay would make a forced-relay verification silently test the
+// direct path instead.
+func TestLoginRoundTripPreservesDestination(t *testing.T) {
+	a, password, _ := newTestAuth(t)
+	h := protected(a)
+
+	// 1. An unauthenticated visit to /?relay is redirected carrying next.
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/?relay", nil))
+	loc := w.Header().Get("Location")
+	if want := "/login?next=" + url.QueryEscape("/?relay"); loc != want {
+		t.Fatalf("login redirect = %q, want %q", loc, want)
+	}
+
+	post := func(target, pw string) *httptest.ResponseRecorder {
+		form := url.Values{"password": {pw}}
+		r := httptest.NewRequest(http.MethodPost, target, strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+
+	// 2. A wrong password keeps next through the retry — a typo must not cost the
+	// destination even though the form posts back to the current URL.
+	if got := post(loc, "typo").Header().Get("Location"); !strings.Contains(got, "error=1") ||
+		!strings.Contains(got, url.QueryEscape("/?relay")) {
+		t.Errorf("failed-login redirect = %q; the retry dropped either the error flag or next", got)
+	}
+
+	// 3. The correct password lands on the original destination.
+	if got := post(loc, password).Header().Get("Location"); got != "/?relay" {
+		t.Errorf("post-login redirect = %q, want /?relay", got)
+	}
+}
+
+// next rides the login URL, so an attacker can craft it: anything but a strictly
+// local path must fall back to "/", or a phishing link could bounce a fresh login
+// onto its own copy of the page (open redirect).
+func TestLoginNextRefusesOffsiteDestinations(t *testing.T) {
+	a, password, _ := newTestAuth(t)
+	h := protected(a)
+
+	for _, tc := range []struct{ name, next, want string }{
+		{"protocol-relative", "//evil.example", "/"},
+		{"absolute url", "https://evil.example/", "/"},
+		{"backslash protocol-relative", `/\evil.example`, "/"},
+		{"scheme without slashes", "javascript:alert(1)", "/"},
+		{"control characters", "/ok\r\nX-Injected: 1", "/"},
+		{"empty", "", "/"},
+		{"relative path", "evil", "/"},
+		{"legitimate path with query", "/?relay", "/?relay"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			form := url.Values{"password": {password}}
+			r := httptest.NewRequest(http.MethodPost, "/login?next="+url.QueryEscape(tc.next),
+				strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if got := w.Header().Get("Location"); got != tc.want {
+				t.Errorf("next=%q redirected to %q, want %q", tc.next, got, tc.want)
+			}
+		})
+	}
+}
+
+// A file holding SOME core secrets but not all is damage, not a fresh install:
+// refuse loudly instead of silently rotating credentials the owner believes stable.
+func TestPartialConfigStillRefusesToLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"token":"abc"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(path, false); err == nil {
+		t.Error("a truncated config loaded; missing secrets would be silently regenerated")
+	}
+}
+
+// storedFile reads the on-disk secrets for direct inspection.
+func storedFile(t *testing.T, path string) stored {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var s stored
+	if err := json.Unmarshal(raw, &s); err != nil {
+		t.Fatalf("parse %s: %v", path, err)
+	}
+	return s
 }
 
 // distributedAttempt posts a login from a DIFFERENT address each time, so per-IP
