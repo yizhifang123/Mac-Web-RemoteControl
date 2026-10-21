@@ -98,10 +98,12 @@ The built-in gate is the floor, not the ceiling.
 ## Networks that block direct UDP
 
 Some managed and corporate networks block UDP or force a proxy, which prevents the
-peer-to-peer path from forming. **There is no TURN relay fallback implemented**, so on
-such a network this will not connect.
+peer-to-peer path from forming. On such a network media needs a TURN relay: store a
+Cloudflare TURN key with `./dev.sh run -set-turn-key` (key ID, then API token, on
+stdin), restart, and the server hands the browser short-lived relay credentials —
+including `turns:…:443?transport=tcp`, which looks like ordinary HTTPS to a firewall.
 
 Before investing effort, test from the network you actually care about: open a
 trickle-ICE candidate-gathering test and see which candidate types appear. `host` or
-`srflx` means direct UDP works. If only `relay` appears, you would need TURN support —
-ideally TURN-over-TLS on 443 — which is not built yet.
+`srflx` means direct UDP works. If only `relay` appears, configure the TURN key above.
+Open the client with `?relay` to force the relay path and confirm it works.

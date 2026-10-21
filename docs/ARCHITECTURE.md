@@ -129,8 +129,9 @@ binaries, and the hop carries only SDP/ICE at setup — never media.
 
 ## Known gaps
 
-- **No TURN fallback.** If a network blocks direct UDP, there is no relay path and the
-  connection fails. This is the biggest functional gap.
+- **TURN is opt-in.** `internal/ice` mints short-lived Cloudflare TURN credentials
+  server-side (behind the password gate, at `/ice-servers`) only when a key is stored
+  with `-set-turn-key`; without one it is STUN-only.
 - **No adaptive bitrate.** The right approach is Pion's congestion-control interceptor
   (`pion/interceptor/pkg/cc`) driving the encoder's bitrate, reading the sender-side
   estimate — not a client `getStats` round-trip.
