@@ -117,6 +117,11 @@ case "${1:-}" in
 
   build)
     mkdir -p bin
+    # `go build` never re-hashes the extracted module cache, so a tampered file under
+    # $GOMODCACHE compiles silently (incident 2026-11-02). Verify first, every build.
+    go mod verify || { echo "dev.sh: go mod verify FAILED — module cache tampered or corrupt; see docs/SECURITY.md" >&2; exit 1; }
+    # -mod=readonly: a build may never rewrite go.mod / go.sum.
+    export GOFLAGS="${GOFLAGS:+$GOFLAGS }-mod=readonly"
     go build -o bin/play   ./cmd/play
     go build -o bin/signal ./cmd/signal
     go build -o bin/host   ./cmd/host
